@@ -1,0 +1,67 @@
+name: ARC Firmware
+
+on: [push, pull_request]
+
+jobs:
+  arcldr:
+    name: ARC Firmware loader
+    runs-on: ubuntu-latest
+    container: devkitpro/devkitppc:latest
+ 
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Build ARC Firmware loader
+      run: |
+        cd arcldr
+        make -f Makefile.wii
+        make -f Makefile.gc
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: Loader
+        path: arcldr/arcldr_*.dol
+        
+  arcfw:
+    name: ARC Firmware
+    runs-on: ubuntu-latest
+    container: devkitpro/devkitppc:latest
+ 
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Build little endian libc
+      run: |
+        cd arcfw/baselibc
+        make
+        
+    - name: Install zstd
+      run: |
+        apt-get -y install zstd
+
+    - name: Cache libc
+      id: cache-libc
+      uses: actions/cache@v4
+      with:
+        path: arcfw/gccle
+        key: gccle-libc
+        
+    - name: Download libc
+      if: steps.cache-libc.outputs.cache-hit != 'true'
+      run: |
+        cd ..
+        wget -nv https://repo-de.voidlinux.org/current/cross-powerpcle-linux-gnu-0.34_1.x86_64.xbps
+        zstdcat cross-powerpcle-linux-gnu-0.34_1.x86_64.xbps -o cross-powerpcle-linux-gnu-0.34_1.x86_64.tar
+        tar -xf cross-powerpcle-linux-gnu-0.34_1.x86_64.tar
+        cp usr/lib/gcc/powerpcle-linux-gnu/10.2/libgcc.a entii-for-workcubes/arcfw/gccle/
+        
+    - name: Build ARC Firmware
+      run: |
+        cd arcfw
+        mkdir build
+        make
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: Firmware
+        path: arcfw/arcfw.elf
