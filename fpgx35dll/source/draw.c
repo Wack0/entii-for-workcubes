@@ -10,8 +10,16 @@ static ULONG CalculateTexOffset(ULONG x, ULONG y, ULONG width) {
 		(((y % 4 << 2) + x % 4) << 1);
 }
 
-#define CalculateTexYOffset(y, width) (((((y) >> 2) << 4) * (width)) + ((((y) & 3) << 2) << 1))
-#define CalculateTexOffsetWithYOffset(x, yOffset) (yOffset) + (((x) >> 2) << 6) + (((x) & 3) << 1)
+static ULONG CalculateTexYOffset(ULONG y, ULONG width) {
+	return (((y >> 2) << 4) * width) +
+		(((y & 3) << 2) << 1);
+}
+
+static ULONG CalculateTexOffsetWithYOffset(ULONG x, ULONG yOffset) {
+	return yOffset +
+		((x >> 2) << 6) +
+		((x & 3) << 1);
+}
 
 static ULONG TexReadRgb(PUCHAR pTex, ULONG offset) {
 	ULONG r = NativeReadBase8(pTex, offset + 1);
