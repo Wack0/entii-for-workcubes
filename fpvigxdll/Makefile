@@ -25,7 +25,7 @@ INCLUDES	:=
 # options for code generation
 #---------------------------------------------------------------------------------
 
-CFLAGS	= -O1 $(MACHDEP) $(INCLUDE) -D_NTDRIVER_
+CFLAGS	= -O3 -fno-align-functions -fno-align-labels -fno-align-jumps -fno-align-loops -fno-ipa-cp $(MACHDEP) $(INCLUDE) -D_NTDRIVER_
 CXXFLAGS	=	$(CFLAGS)
 CPPFLAGS = $(INCLUDE) -D_NTDRIVER_
 

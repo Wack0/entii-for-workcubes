@@ -10,6 +10,9 @@ static ULONG CalculateTexOffset(ULONG x, ULONG y, ULONG width) {
 		(((y % 4 << 2) + x % 4) << 1);
 }
 
+#define CalculateTexYOffset(y, width) (((((y) >> 2) << 4) * (width)) + ((((y) & 3) << 2) << 1))
+#define CalculateTexOffsetWithYOffset(x, yOffset) (yOffset) + (((x) >> 2) << 6) + (((x) & 3) << 1)
+
 static ULONG TexReadRgb(PUCHAR pTex, ULONG offset) {
 	ULONG r = NativeReadBase8(pTex, offset + 1);
 	ULONG gb = NativeReadBase16(pTex, offset + 32);
@@ -22,7 +25,7 @@ static void TexWriteRgb(PUCHAR pTex, ULONG offset, ULONG rgb) {
 		ULONG offset32 = offset & ~3;
 		ULONG value = NativeReadBase32(pTex, offset32);
 		value &= 0xFFFF0000;
-		value |= 0xFF00 | ((rgb >> 16) & 0xFF);
+		value |= 0xFF00 | (rgb >> 16);
 		ULONG value2 = NativeReadBase32(pTex, offset32 + 0x20);
 		value2 &= 0xFFFF0000;
 		value2 |= (rgb & 0xFFFF);
@@ -31,7 +34,7 @@ static void TexWriteRgb(PUCHAR pTex, ULONG offset, ULONG rgb) {
 	} else {
 		ULONG value = NativeReadBase32(pTex, offset);
 		value &= 0x0000FFFF;
-		value |= (0xFF00 | ((rgb >> 16) & 0xFF)) << 16;
+		value |= (0xFF000000 | (rgb & 0xFF0000));
 		ULONG value2 = NativeReadBase32(pTex, offset + 0x20);
 		value2 &= 0x0000FFFF;
 		value2 |= (rgb & 0xFFFF) << 16;
@@ -41,9 +44,7 @@ static void TexWriteRgb(PUCHAR pTex, ULONG offset, ULONG rgb) {
 }
 
 static void TexWriteRgb2Aligned(PUCHAR pTex, ULONG offset, ULONG rgb0, ULONG rgb1) {
-	UCHAR r0 = (rgb0 >> 16) & 0xFF;
-	UCHAR r1 = (rgb1 >> 16) & 0xFF;
-	ULONG value = 0xFF00FF00 | ((rgb1 >> 16) & 0xFF) | (((rgb0 >> 16) & 0xFF) << 16);
+	ULONG value = 0xFF00FF00 | (rgb1 >> 16) | (rgb0 & 0xFF0000);
 	ULONG value2 = ((rgb0 & 0xFFFF) << 16) | (rgb1 & 0xFFFF);
 	NativeWriteBase32(pTex, offset, value);
 	NativeWriteBase32(pTex, offset + 0x20, value2);
@@ -112,6 +113,7 @@ BOOL copyFromFb)
 		PULONG pulDstTemp = pulDst;
 		// Bounds check the pointers, we could be in here when drawing off the screen
 		if (pulSrc >= pstartSrc && pulDst >= pstartDst) {
+			ULONG TexOffsetY = CalculateTexYOffset(yDstStart + cyIdx, destWidth);
 			ULONG TexOffset = 0;
 			
 			ULONG cxTemp = cx;
@@ -125,7 +127,7 @@ BOOL copyFromFb)
 						(xSrc + cxIdx) < srcWidth &&
 						(ySrc + cyIdx) < srcHeight;
 					if (validAccess) {
-						TexOffset = CalculateTexOffset(xSrc + cxIdx, ySrc + cyIdx, srcWidth);
+						TexOffset = CalculateTexOffsetWithYOffset(xSrc + cxIdx, TexOffsetY);
 						//pulSrcTemp++;
 						*pulDstTemp = TexReadRgb(pSrcFbStart, TexOffset);
 					}
@@ -144,9 +146,8 @@ BOOL copyFromFb)
 						pulSrcTemp++;
 						//EfbWrite32(pulDstTemp, sourceVal);
 						//pulDstTemp++;
-						TexOffset = CalculateTexOffset(xDst + cxIdx, yDstStart + cyIdx, destWidth);
-						ULONG TexOffset2 = CalculateTexOffset(xDst + cxIdx + 1, yDstStart + cyIdx, destWidth);
-						if (((TexOffset & 3) == 0) && (TexOffset2 == (TexOffset + 2)) && (cxTemp > 1)) {
+						TexOffset = CalculateTexOffsetWithYOffset(xSrc + cxIdx, TexOffsetY);
+						if (((TexOffset & 3) == 0) && ((xDst + cxIdx) & 3) < 3 && (cxTemp > 1)) {
 							// Will be writing the next pixel too, we can optimise this to two writes from four reads and four writes.
 							ULONG sourceVal2 = LoadToRegister32(*pulSrcTemp);
 							pulSrcTemp++;
