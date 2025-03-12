@@ -10,6 +10,17 @@ static ULONG CalculateTexOffset(ULONG x, ULONG y, ULONG width) {
 		(((y % 4 << 2) + x % 4) << 1);
 }
 
+static ULONG CalculateTexYOffset(ULONG y, ULONG width) {
+	return (((y >> 2) << 4) * width) +
+		(((y & 3) << 2) << 1);
+}
+
+static ULONG CalculateTexOffsetWithYOffset(ULONG x, ULONG yOffset) {
+	return yOffset +
+		((x >> 2) << 6) +
+		((x & 3) << 1);
+}
+
 static ULONG TexReadRgb(PUCHAR pTex, ULONG offset) {
 	ULONG r = NativeReadBase8(pTex, offset + 1);
 	ULONG gb = NativeReadBase16(pTex, offset + 32);
@@ -22,7 +33,7 @@ static void TexWriteRgb(PUCHAR pTex, ULONG offset, ULONG rgb) {
 		ULONG offset32 = offset & ~3;
 		ULONG value = NativeReadBase32(pTex, offset32);
 		value &= 0xFFFF0000;
-		value |= 0xFF00 | ((rgb >> 16) & 0xFF);
+		value |= 0xFF00 | (rgb >> 16);
 		ULONG value2 = NativeReadBase32(pTex, offset32 + 0x20);
 		value2 &= 0xFFFF0000;
 		value2 |= (rgb & 0xFFFF);
@@ -31,7 +42,7 @@ static void TexWriteRgb(PUCHAR pTex, ULONG offset, ULONG rgb) {
 	} else {
 		ULONG value = NativeReadBase32(pTex, offset);
 		value &= 0x0000FFFF;
-		value |= (0xFF00 | ((rgb >> 16) & 0xFF)) << 16;
+		value |= (0xFF000000 | (rgb & 0xFF0000));
 		ULONG value2 = NativeReadBase32(pTex, offset + 0x20);
 		value2 &= 0x0000FFFF;
 		value2 |= (rgb & 0xFFFF) << 16;
@@ -41,9 +52,7 @@ static void TexWriteRgb(PUCHAR pTex, ULONG offset, ULONG rgb) {
 }
 
 static void TexWriteRgb2Aligned(PUCHAR pTex, ULONG offset, ULONG rgb0, ULONG rgb1) {
-	UCHAR r0 = (rgb0 >> 16) & 0xFF;
-	UCHAR r1 = (rgb1 >> 16) & 0xFF;
-	ULONG value = 0xFF00FF00 | ((rgb1 >> 16) & 0xFF) | (((rgb0 >> 16) & 0xFF) << 16);
+	ULONG value = 0xFF00FF00 | (rgb1 >> 16) | (rgb0 & 0xFF0000);
 	ULONG value2 = ((rgb0 & 0xFFFF) << 16) | (rgb1 & 0xFFFF);
 	NativeWriteBase32(pTex, offset, value);
 	NativeWriteBase32(pTex, offset + 0x20, value2);
@@ -55,8 +64,7 @@ SURFOBJ  *psoSrc,
 CLIPOBJ  *pco,
 XLATEOBJ *pxlo,
 RECTL    *prclDest,
-POINTL   *pptlSrc,
-BOOL copyFromFb)
+POINTL   *pptlSrc)
 {
 /*
 	Copy 32bpp bitmap data endian swapped
@@ -112,55 +120,38 @@ BOOL copyFromFb)
 		PULONG pulDstTemp = pulDst;
 		// Bounds check the pointers, we could be in here when drawing off the screen
 		if (pulSrc >= pstartSrc && pulDst >= pstartDst) {
+			ULONG TexOffsetY = CalculateTexYOffset(yDstStart + cyIdx, destWidth);
 			ULONG TexOffset = 0;
 			
 			ULONG cxTemp = cx;
 			ULONG cxIdx = 0;
 			BOOLEAN validAccess;
-			if (copyFromFb) {
-				// Read swapped from source, write normally to dest.
-				while (cxTemp--) {
-					validAccess = pulSrcTemp >= pstartSrc && pulDstTemp >= pstartDst &&
-						pulSrcTemp < pendSrc && pulDstTemp < pendDst &&
-						(xSrc + cxIdx) < srcWidth &&
-						(ySrc + cyIdx) < srcHeight;
-					if (validAccess) {
-						TexOffset = CalculateTexOffset(xSrc + cxIdx, ySrc + cyIdx, srcWidth);
-						//pulSrcTemp++;
-						*pulDstTemp = TexReadRgb(pSrcFbStart, TexOffset);
-					}
-					pulDstTemp++;
-					cxIdx++;
-				}
-			} else {
-				// Read normally from source, write swapped to dest.
-				while (cxTemp--) {
-					validAccess = pulSrcTemp >= pstartSrc && pulDstTemp >= pstartDst &&
-						pulSrcTemp < pendSrc && pulDstTemp < pendDst &&
-						(xDst + cxIdx) < destWidth &&
-						(yDst + cyIdx) < destHeight;
-					if (validAccess) {
-						ULONG sourceVal = LoadToRegister32(*pulSrcTemp);
+			// Read normally from source, write swapped to dest.
+			while (cxTemp--) {
+				validAccess = pulSrcTemp >= pstartSrc && pulDstTemp >= pstartDst &&
+					pulSrcTemp < pendSrc && pulDstTemp < pendDst &&
+					(xDst + cxIdx) < destWidth &&
+					(yDst + cyIdx) < destHeight;
+				if (validAccess) {
+					ULONG sourceVal = LoadToRegister32(*pulSrcTemp);
+					pulSrcTemp++;
+					//EfbWrite32(pulDstTemp, sourceVal);
+					//pulDstTemp++;
+					TexOffset = CalculateTexOffsetWithYOffset(xSrc + cxIdx, TexOffsetY);
+					if (((TexOffset & 3) == 0) && ((xDst + cxIdx) & 3) < 3 && (cxTemp > 1)) {
+						// Will be writing the next pixel too, we can optimise this to two writes from four reads and four writes.
+						ULONG sourceVal2 = LoadToRegister32(*pulSrcTemp);
 						pulSrcTemp++;
-						//EfbWrite32(pulDstTemp, sourceVal);
-						//pulDstTemp++;
-						TexOffset = CalculateTexOffset(xDst + cxIdx, yDstStart + cyIdx, destWidth);
-						ULONG TexOffset2 = CalculateTexOffset(xDst + cxIdx + 1, yDstStart + cyIdx, destWidth);
-						if (((TexOffset & 3) == 0) && (TexOffset2 == (TexOffset + 2)) && (cxTemp > 1)) {
-							// Will be writing the next pixel too, we can optimise this to two writes from four reads and four writes.
-							ULONG sourceVal2 = LoadToRegister32(*pulSrcTemp);
-							pulSrcTemp++;
-							TexWriteRgb2Aligned(pDestFbStart, TexOffset, sourceVal, sourceVal2);
-							cxIdx++;
-							cxTemp--;
-						} else {
-							TexWriteRgb(pDestFbStart, TexOffset, sourceVal);
-						}
+						TexWriteRgb2Aligned(pDestFbStart, TexOffset, sourceVal, sourceVal2);
+						cxIdx++;
+						cxTemp--;
 					} else {
-						pulSrcTemp++;
+						TexWriteRgb(pDestFbStart, TexOffset, sourceVal);
 					}
-					cxIdx++;
+				} else {
+					pulSrcTemp++;
 				}
+				cxIdx++;
 			}
 		}
 		
@@ -173,6 +164,7 @@ BOOL copyFromFb)
 	
 	return TRUE;
 }
+
 
 BOOL DrvCopyBits(
 SURFOBJ  *psoDest,
@@ -227,7 +219,7 @@ POINTL   *pptlSrc)
 			return FALSE;
 		}
 		psoDest = ppDev->psurfBigFb;
-		return CopyBitsSwap32(psoDest, psoSrc, NULL, NULL, prclDest, &point, FALSE);
+		return CopyBitsSwap32(psoDest, psoSrc, NULL, NULL, prclDest, &point);
 	}
 	
 	// Copying to framebuffer
@@ -240,7 +232,7 @@ POINTL   *pptlSrc)
 		}
 		psoSrc = psoDest;
 		psoDest = ppDev->psurfBigFb;
-		return CopyBitsSwap32(psoDest, psoSrc, NULL, NULL, prclDest, &point, FALSE);
+		return CopyBitsSwap32(psoDest, psoSrc, NULL, NULL, prclDest, &point);
 	}
 	
 	// Copying from framebuffer
@@ -299,7 +291,7 @@ MIX        mix)
 	}
 	
 	// Copy back to the framebuffer
-	return CopyBitsSwap32(ppdev->psurfBigFb, ppdev->psurfDouble, NULL, NULL, &destRect, &point, FALSE);
+	return CopyBitsSwap32(ppdev->psurfBigFb, ppdev->psurfDouble, NULL, NULL, &destRect, &point);
 }
 
 BOOL DrvTextOut(
@@ -340,5 +332,5 @@ MIX       mix)
 	}
 	
 	// Copy back to the framebuffer
-	return CopyBitsSwap32(ppdev->psurfBigFb, ppdev->psurfDouble, NULL, NULL, &rclDest, &point, FALSE);
+	return CopyBitsSwap32(ppdev->psurfBigFb, ppdev->psurfDouble, NULL, NULL, &rclDest, &point);
 }
