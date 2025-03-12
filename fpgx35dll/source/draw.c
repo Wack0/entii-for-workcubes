@@ -64,8 +64,7 @@ SURFOBJ  *psoSrc,
 CLIPOBJ  *pco,
 XLATEOBJ *pxlo,
 RECTL    *prclDest,
-POINTL   *pptlSrc,
-BOOL copyFromFb)
+POINTL   *pptlSrc)
 {
 /*
 	Copy 32bpp bitmap data endian swapped
@@ -127,49 +126,32 @@ BOOL copyFromFb)
 			ULONG cxTemp = cx;
 			ULONG cxIdx = 0;
 			BOOLEAN validAccess;
-			if (copyFromFb) {
-				// Read swapped from source, write normally to dest.
-				while (cxTemp--) {
-					validAccess = pulSrcTemp >= pstartSrc && pulDstTemp >= pstartDst &&
-						pulSrcTemp < pendSrc && pulDstTemp < pendDst &&
-						(xSrc + cxIdx) < srcWidth &&
-						(ySrc + cyIdx) < srcHeight;
-					if (validAccess) {
-						TexOffset = CalculateTexOffsetWithYOffset(xSrc + cxIdx, TexOffsetY);
-						//pulSrcTemp++;
-						*pulDstTemp = TexReadRgb(pSrcFbStart, TexOffset);
-					}
-					pulDstTemp++;
-					cxIdx++;
-				}
-			} else {
-				// Read normally from source, write swapped to dest.
-				while (cxTemp--) {
-					validAccess = pulSrcTemp >= pstartSrc && pulDstTemp >= pstartDst &&
-						pulSrcTemp < pendSrc && pulDstTemp < pendDst &&
-						(xDst + cxIdx) < destWidth &&
-						(yDst + cyIdx) < destHeight;
-					if (validAccess) {
-						ULONG sourceVal = LoadToRegister32(*pulSrcTemp);
+			// Read normally from source, write swapped to dest.
+			while (cxTemp--) {
+				validAccess = pulSrcTemp >= pstartSrc && pulDstTemp >= pstartDst &&
+					pulSrcTemp < pendSrc && pulDstTemp < pendDst &&
+					(xDst + cxIdx) < destWidth &&
+					(yDst + cyIdx) < destHeight;
+				if (validAccess) {
+					ULONG sourceVal = LoadToRegister32(*pulSrcTemp);
+					pulSrcTemp++;
+					//EfbWrite32(pulDstTemp, sourceVal);
+					//pulDstTemp++;
+					TexOffset = CalculateTexOffsetWithYOffset(xSrc + cxIdx, TexOffsetY);
+					if (((TexOffset & 3) == 0) && ((xDst + cxIdx) & 3) < 3 && (cxTemp > 1)) {
+						// Will be writing the next pixel too, we can optimise this to two writes from four reads and four writes.
+						ULONG sourceVal2 = LoadToRegister32(*pulSrcTemp);
 						pulSrcTemp++;
-						//EfbWrite32(pulDstTemp, sourceVal);
-						//pulDstTemp++;
-						TexOffset = CalculateTexOffsetWithYOffset(xSrc + cxIdx, TexOffsetY);
-						if (((TexOffset & 3) == 0) && ((xDst + cxIdx) & 3) < 3 && (cxTemp > 1)) {
-							// Will be writing the next pixel too, we can optimise this to two writes from four reads and four writes.
-							ULONG sourceVal2 = LoadToRegister32(*pulSrcTemp);
-							pulSrcTemp++;
-							TexWriteRgb2Aligned(pDestFbStart, TexOffset, sourceVal, sourceVal2);
-							cxIdx++;
-							cxTemp--;
-						} else {
-							TexWriteRgb(pDestFbStart, TexOffset, sourceVal);
-						}
+						TexWriteRgb2Aligned(pDestFbStart, TexOffset, sourceVal, sourceVal2);
+						cxIdx++;
+						cxTemp--;
 					} else {
-						pulSrcTemp++;
+						TexWriteRgb(pDestFbStart, TexOffset, sourceVal);
 					}
-					cxIdx++;
+				} else {
+					pulSrcTemp++;
 				}
+				cxIdx++;
 			}
 		}
 		
@@ -191,7 +173,7 @@ static inline LONG HookSignExt16(SHORT x) {
     return (LONG)x;
 }
 
-static BOOL IsRetAddrBad(PPPC_INSTRUCTION Addr) {
+__attribute__((optimize("O1"))) __attribute__((noinline)) static BOOL IsRetAddrBad(PPPC_INSTRUCTION Addr) {
 	static ULONG s_RetAddrBad = 0;
 	if (s_RetAddrBad != 0) return (ULONG)Addr == s_RetAddrBad;
 	PPPC_INSTRUCTION Insn = Addr;
@@ -291,7 +273,7 @@ POINTL   *pptlSrc)
 			return FALSE;
 		}
 		psoDest = ppDev->psurfBigFb;
-		return CopyBitsSwap32(psoDest, psoSrc, NULL, NULL, prclDest, &point, FALSE);
+		return CopyBitsSwap32(psoDest, psoSrc, NULL, NULL, prclDest, &point);
 	}
 	
 	// Try to detect CvtDFB2DIB, and fail if so.
@@ -313,7 +295,7 @@ POINTL   *pptlSrc)
 		}
 		psoSrc = psoDest;
 		psoDest = ppDev->psurfBigFb;
-		return CopyBitsSwap32(psoDest, psoSrc, NULL, NULL, prclDest, &point, FALSE);
+		return CopyBitsSwap32(psoDest, psoSrc, NULL, NULL, prclDest, &point);
 	}
 	
 	// Copying from framebuffer
@@ -372,7 +354,7 @@ MIX        mix)
 	}
 	
 	// Copy back to the framebuffer
-	return CopyBitsSwap32(ppdev->psurfBigFb, ppdev->psurfDouble, NULL, NULL, &destRect, &point, FALSE);
+	return CopyBitsSwap32(ppdev->psurfBigFb, ppdev->psurfDouble, NULL, NULL, &destRect, &point);
 }
 
 BOOL DrvTextOut(
@@ -413,5 +395,5 @@ MIX       mix)
 	}
 	
 	// Copy back to the framebuffer
-	return CopyBitsSwap32(ppdev->psurfBigFb, ppdev->psurfDouble, NULL, NULL, &rclDest, &point, FALSE);
+	return CopyBitsSwap32(ppdev->psurfBigFb, ppdev->psurfDouble, NULL, NULL, &rclDest, &point);
 }
