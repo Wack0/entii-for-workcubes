@@ -273,7 +273,8 @@ static void PepCopyLeDoubleBufferToEfb(PDEVICE_EXTENSION Extension) {
 
 static void PepCopyBeDoubleBufferToEfb(PDEVICE_EXTENSION Extension) {
 	// Flush dcache for double buffer.
-	HalSweepDcacheRange(Extension->DoubleFrameBuffer, DOUBLE_FRAMEBUFFER_LENGTH);
+	// Not actually needed as the double buffer is always mapped uncached.
+	//HalSweepDcacheRange(Extension->DoubleFrameBuffer, DOUBLE_FRAMEBUFFER_LENGTH);
 	
 	ULONG NumberOfBytesWritten = 0;
 	// Invalidate vertex cache.
