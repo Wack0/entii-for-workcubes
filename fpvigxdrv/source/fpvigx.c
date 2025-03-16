@@ -57,7 +57,6 @@ typedef struct _DEVICE_EXTENSION {
 	PUSHORT ArrayVerticies;
 	ULONG ArrayVerticiesPhys;
 	ULONG VideoModeIndex;
-	ULONG CurrentDoubleOffset;
 	KDPC TimerDpc;
 	KTIMER Timer;
 	//BOOLEAN InIoSpace;
@@ -888,7 +887,6 @@ VP_STATUS ViFindAdapter(PVOID HwDeviceExtension, PVOID HwContext, PWSTR Argument
 	Extension->BitmapBuffer = NULL;
 	Extension->DoubleFrameBufferPhys = 0;
 	Extension->FrameBufferOffset = 0;
-	Extension->CurrentDoubleOffset = 0;
 	Extension->VideoModeIndex = 0;
 	if (SetupddLoaded || !HasWin32k)
 	{
@@ -1013,6 +1011,7 @@ VP_STATUS ViFindAdapter(PVOID HwDeviceExtension, PVOID HwContext, PWSTR Argument
 			if (Res == RESOLUTION_240P) {
 				s_VideoModes[i].VisScreenWidth = 320;
 				s_VideoModes[i].VisScreenHeight = 240;
+				s_VideoModes[i].ScreenStride = 320 * sizeof(ULONG);
 			}
 			
 			if (Depth == COLOUR_DEPTH_16) {
@@ -1372,14 +1371,6 @@ VP_STATUS ViStartIoImpl(PDEVICE_EXTENSION Extension, PVIDEO_REQUEST_PACKET Reque
 			VI_INTERRUPT_DISABLE(0);
 			VI_INTERRUPT_DISABLE(1);
 			Extension->VideoModeIndex = Mode->RequestedMode;
-			ULONG Offset = 0;
-			if ((Extension->VideoModeIndex / RESOLUTION_COUNT) == RESOLUTION_240P) {
-				Offset = DOUBLE_FRAMEBUFFER_STRIDE;
-				ULONG CentreHeight = (480 / 2) - (240 / 2);
-				Offset *= CentreHeight;
-				Offset += (640 / 2) - (320 / 2);
-			}
-			Extension->CurrentDoubleOffset = Offset;
 			ViInitialise(Extension);
 			return NO_ERROR;
 		}

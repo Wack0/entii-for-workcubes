@@ -59,13 +59,21 @@ POINTL   *pptlSrc)
 	ULONG destWidth = psoDest->sizlBitmap.cx;
 	if (psoDest->lDelta < 0) pDestFbStart += (destHeight * psoDest->lDelta);
 	
+	ULONG heightOffset = 0, widthOffset = 0;
+	if (destHeight == 240) {
+		heightOffset = (480 / 2) - (240 / 2);
+		widthOffset = (640 / 2) - (320 / 2);
+	}
+	if ((heightOffset & 1) != 0) heightOffset--;
+	if ((widthOffset & 1) != 0) widthOffset--;
+	
 	ULONG cyIdx = 0;
 	while (1) {
 		PULONG pulSrcTemp = pulSrc;
 		PULONG pulDstTemp = pulDst;
 		// Bounds check the pointers, we could be in here when drawing off the screen
 		if (pulSrc >= pstartSrc && pulDst >= pstartDst) {
-			ULONG TexOffsetY = CalculateTexYOffset32(yDstStart + cyIdx, destWidth);
+			ULONG TexOffsetY = CalculateTexYOffset32(yDstStart + cyIdx + heightOffset, 640);
 			ULONG TexOffset = 0;
 			
 			ULONG cxTemp = cx;
@@ -82,7 +90,7 @@ POINTL   *pptlSrc)
 					pulSrcTemp++;
 					//EfbWrite32(pulDstTemp, sourceVal);
 					//pulDstTemp++;
-					TexOffset = CalculateTexOffsetWithYOffset32(xDst + cxIdx, TexOffsetY);
+					TexOffset = CalculateTexOffsetWithYOffset32(xDst + cxIdx + widthOffset, TexOffsetY);
 					if (((TexOffset & 3) == 0) && ((xDst + cxIdx) & 3) < 3 && (cxTemp > 1)) {
 						// Will be writing the next pixel too, we can optimise this to two writes from four reads and four writes.
 						ULONG sourceVal2 = LoadToRegister32(*pulSrcTemp);
@@ -172,13 +180,21 @@ POINTL   *pptlSrc)
 	ULONG destWidth = psoDest->sizlBitmap.cx;
 	if (psoDest->lDelta < 0) pDestFbStart += (destHeight * psoDest->lDelta);
 	
+	ULONG heightOffset = 0, widthOffset = 0;
+	if (destHeight == 240) {
+		heightOffset = (480 / 2) - (240 / 2);
+		widthOffset = (640 / 2) - (320 / 2);
+	}
+	if ((heightOffset & 1) != 0) heightOffset--;
+	if ((widthOffset & 1) != 0) widthOffset--;
+	
 	ULONG cyIdx = 0;
 	while (1) {
 		PUSHORT pusSrcTemp = pusSrc;
 		PUSHORT pusDstTemp = pusDst;
 		// Bounds check the pointers, we could be in here when drawing off the screen
 		if (pusSrc >= pstartSrc && pusDst >= pstartDst) {
-			ULONG TexOffsetY = CalculateTexYOffset16(yDstStart + cyIdx, destWidth);
+			ULONG TexOffsetY = CalculateTexYOffset16(yDstStart + cyIdx + heightOffset, 640);
 			ULONG TexOffset = 0;
 			
 			ULONG cxTemp = cx;
@@ -193,7 +209,7 @@ POINTL   *pptlSrc)
 				if (validAccess) {
 					//EfbWrite32(pulDstTemp, sourceVal);
 					//pulDstTemp++;
-					TexOffset = CalculateTexOffsetWithYOffset16(xDst + cxIdx, TexOffsetY);
+					TexOffset = CalculateTexOffsetWithYOffset16(xDst + cxIdx + widthOffset, TexOffsetY);
 					if (((TexOffset & 3) == 0) && ((xDst + cxIdx) & 3) < 3 && (cxTemp > 1)) {
 						// Will be writing the next pixel too, optimise to a single write from one read and one write
 						ULONG sourceVal2 = LoadToRegister32(*(PULONG)pusSrcTemp);
@@ -280,13 +296,21 @@ POINTL   *pptlSrc)
 	ULONG destWidth = psoDest->sizlBitmap.cx;
 	if (lDeltaDst < 0) pDestFbStart += (destHeight * lDeltaDst);
 	
+	ULONG heightOffset = 0, widthOffset = 0;
+	if (destHeight == 240) {
+		heightOffset = (480 / 2) - (240 / 2);
+		widthOffset = (640 / 2) - (320 / 2);
+	}
+	if ((heightOffset & 3) != 0) heightOffset -= (4 - (heightOffset & 3));
+	if ((widthOffset & 3) != 0) widthOffset -= (4 - (widthOffset & 3));
+	
 	ULONG cyIdx = 0;
 	while (1) {
 		PUCHAR pucSrcTemp = pucSrc;
 		PUCHAR pucDstTemp = pucDst;
 		// Bounds check the pointers, we could be in here when drawing off the screen
 		if (pucSrc >= pstartSrc && pucDst >= pstartDst) {
-			ULONG TexOffsetY = CalculateTexYOffset8(yDstStart + cyIdx, destWidth);
+			ULONG TexOffsetY = CalculateTexYOffset8(yDstStart + cyIdx + heightOffset, 640);
 			ULONG TexOffset = 0;
 			
 			ULONG cxTemp = cx;
@@ -301,7 +325,7 @@ POINTL   *pptlSrc)
 				if (validAccess) {
 					//EfbWrite32(pulDstTemp, sourceVal);
 					//pulDstTemp++;
-					TexOffset = CalculateTexOffsetWithYOffset8(xDst + cxIdx, TexOffsetY);
+					TexOffset = CalculateTexOffsetWithYOffset8(xDst + cxIdx + widthOffset, TexOffsetY);
 					if (((TexOffset & 3) == 0) && ((xDst + cxIdx) & 7) < 5 && (cxTemp > 3)) {
 						// Writing aligned at least four pixels.
 						// Optimise to a single write
