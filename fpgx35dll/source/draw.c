@@ -1,64 +1,9 @@
 #include "driver.h"
 #include "runtime.h"
-#include "ppcinst.h"
+#include "texdraw.h"
 
-#define POINTER_SWAP32(ptr) (PULONG)(_Mmio_MungeAddressForBig(ptr, sizeof(ULONG)))
 
-static ULONG CalculateTexOffset(ULONG x, ULONG y, ULONG width) {
-	return (((y >> 2) << 4) * width) +
-		((x >> 2) << 6) +
-		(((y % 4 << 2) + x % 4) << 1);
-}
-
-static ULONG CalculateTexYOffset(ULONG y, ULONG width) {
-	return (((y >> 2) << 4) * width) +
-		(((y & 3) << 2) << 1);
-}
-
-static ULONG CalculateTexOffsetWithYOffset(ULONG x, ULONG yOffset) {
-	return yOffset +
-		((x >> 2) << 6) +
-		((x & 3) << 1);
-}
-
-static ULONG TexReadRgb(PUCHAR pTex, ULONG offset) {
-	ULONG r = NativeReadBase8(pTex, offset + 1);
-	ULONG gb = NativeReadBase16(pTex, offset + 32);
-	return (r << 16) | gb;
-}
-
-static void TexWriteRgb(PUCHAR pTex, ULONG offset, ULONG rgb) {
-	if ((offset & 3) != 0) {
-		// offset must be at +2
-		ULONG offset32 = offset & ~3;
-		ULONG value = NativeReadBase32(pTex, offset32);
-		value &= 0xFFFF0000;
-		value |= 0xFF00 | (rgb >> 16);
-		ULONG value2 = NativeReadBase32(pTex, offset32 + 0x20);
-		value2 &= 0xFFFF0000;
-		value2 |= (rgb & 0xFFFF);
-		NativeWriteBase32(pTex, offset32, value);
-		NativeWriteBase32(pTex, offset32 + 0x20, value2);
-	} else {
-		ULONG value = NativeReadBase32(pTex, offset);
-		value &= 0x0000FFFF;
-		value |= (0xFF000000 | (rgb & 0xFF0000));
-		ULONG value2 = NativeReadBase32(pTex, offset + 0x20);
-		value2 &= 0x0000FFFF;
-		value2 |= (rgb & 0xFFFF) << 16;
-		NativeWriteBase32(pTex, offset, value);
-		NativeWriteBase32(pTex, offset + 0x20, value2);
-	}
-}
-
-static void TexWriteRgb2Aligned(PUCHAR pTex, ULONG offset, ULONG rgb0, ULONG rgb1) {
-	ULONG value = 0xFF00FF00 | (rgb1 >> 16) | (rgb0 & 0xFF0000);
-	ULONG value2 = ((rgb0 & 0xFFFF) << 16) | (rgb1 & 0xFFFF);
-	NativeWriteBase32(pTex, offset, value);
-	NativeWriteBase32(pTex, offset + 0x20, value2);
-}
-
-BOOL CopyBitsSwap32(
+static BOOL CopyBitsSwap32(
 SURFOBJ  *psoDest,
 SURFOBJ  *psoSrc,
 CLIPOBJ  *pco,
@@ -120,7 +65,7 @@ POINTL   *pptlSrc)
 		PULONG pulDstTemp = pulDst;
 		// Bounds check the pointers, we could be in here when drawing off the screen
 		if (pulSrc >= pstartSrc && pulDst >= pstartDst) {
-			ULONG TexOffsetY = CalculateTexYOffset(yDstStart + cyIdx, destWidth);
+			ULONG TexOffsetY = CalculateTexYOffset32(yDstStart + cyIdx, destWidth);
 			ULONG TexOffset = 0;
 			
 			ULONG cxTemp = cx;
@@ -137,7 +82,7 @@ POINTL   *pptlSrc)
 					pulSrcTemp++;
 					//EfbWrite32(pulDstTemp, sourceVal);
 					//pulDstTemp++;
-					TexOffset = CalculateTexOffsetWithYOffset(xSrc + cxIdx, TexOffsetY);
+					TexOffset = CalculateTexOffsetWithYOffset32(xDst + cxIdx, TexOffsetY);
 					if (((TexOffset & 3) == 0) && ((xDst + cxIdx) & 3) < 3 && (cxTemp > 1)) {
 						// Will be writing the next pixel too, we can optimise this to two writes from four reads and four writes.
 						ULONG sourceVal2 = LoadToRegister32(*pulSrcTemp);
@@ -165,60 +110,294 @@ POINTL   *pptlSrc)
 	return TRUE;
 }
 
-static inline LONG HookSignExtBranch(LONG x) {
-    return x & 0x2000000 ? (LONG)(x | 0xFC000000) : (LONG)(x);
+static ULONG Rol32(ULONG Value, ULONG Count) {
+	const ULONG mask = (8 * sizeof(Value) - 1);
+	Count &= mask;
+	return (Value << Count) | (Value >> ( (-Count) & mask));
 }
 
-static inline LONG HookSignExt16(SHORT x) {
-    return (LONG)x;
+static BOOL CopyBitsSwap16(
+SURFOBJ  *psoDest,
+SURFOBJ  *psoSrc,
+CLIPOBJ  *pco,
+XLATEOBJ *pxlo,
+RECTL    *prclDest,
+POINTL   *pptlSrc)
+{
+/*
+	Copy 16bpp bitmap data endian swapped
+*/
+	
+	LONG lDeltaSrc = psoSrc->lDelta;
+	LONG lDeltaDst = psoDest->lDelta;
+	
+	if (pco != NULL &&  pco->iDComplexity != DC_TRIVIAL) {
+		return FALSE;
+	}
+	
+	if (prclDest->top >= prclDest->bottom) return TRUE;
+	if (prclDest->left >= prclDest->right) return TRUE;
+	
+	
+	LONG xDst = prclDest->left;
+	LONG yDst = prclDest->top;
+	LONG xSrc = pptlSrc->x + xDst - prclDest->left;
+	LONG ySrc = pptlSrc->y + yDst - prclDest->top;
+	
+	LONG cx = prclDest->right - xDst;
+	LONG cy = prclDest->bottom - yDst;
+	
+	LONG xSrcStart = xSrc;
+	LONG xSrcEnd = xSrcStart + cx;
+	LONG xDstStart = xDst;
+	LONG yDstStart = prclDest->top;
+	PBYTE pjSrc = ((PBYTE) psoSrc->pvScan0) + (ySrc * psoSrc->lDelta);
+	PBYTE pjDst = ((PBYTE) psoDest->pvScan0) + (yDst * psoDest->lDelta);
+	
+	PUSHORT pusSrc = (PUSHORT) (pjSrc + (2 * xSrcStart));
+	PUSHORT pusDst = (PUSHORT) (pjDst + (2 * xDstStart));
+	PUSHORT pstartSrc = (PUSHORT) psoSrc->pvBits;
+	PUSHORT pendSrc = (PUSHORT) ((PUCHAR) pstartSrc + psoSrc->cjBits);
+	PUSHORT pstartDst = (PUSHORT) psoDest->pvBits;
+	PUSHORT pendDst = (PUSHORT) ((PUCHAR) pstartDst + psoDest->cjBits);
+	ULONG copyX = cx;
+	ULONG copyY = cy;
+	
+	ULONG srcHeight = psoSrc->sizlBitmap.cy;
+	ULONG srcWidth = psoSrc->sizlBitmap.cx;
+	PBYTE pSrcFbStart = ((PBYTE) psoSrc->pvScan0);
+	if (psoSrc->lDelta < 0) pSrcFbStart += (srcHeight * psoSrc->lDelta);
+	PBYTE pDestFbStart = ((PBYTE) psoDest->pvScan0);
+	ULONG destHeight = psoDest->sizlBitmap.cy;
+	ULONG destWidth = psoDest->sizlBitmap.cx;
+	if (psoDest->lDelta < 0) pDestFbStart += (destHeight * psoDest->lDelta);
+	
+	ULONG cyIdx = 0;
+	while (1) {
+		PUSHORT pusSrcTemp = pusSrc;
+		PUSHORT pusDstTemp = pusDst;
+		// Bounds check the pointers, we could be in here when drawing off the screen
+		if (pusSrc >= pstartSrc && pusDst >= pstartDst) {
+			ULONG TexOffsetY = CalculateTexYOffset16(yDstStart + cyIdx, destWidth);
+			ULONG TexOffset = 0;
+			
+			ULONG cxTemp = cx;
+			ULONG cxIdx = 0;
+			BOOLEAN validAccess;
+			// Read normally from source, write swapped to dest.
+			while (cxTemp--) {
+				validAccess = pusSrcTemp >= pstartSrc && pusDstTemp >= pstartDst &&
+					pusSrcTemp < pendSrc && pusDstTemp < pendDst &&
+					(xDst + cxIdx) < destWidth &&
+					(yDst + cyIdx) < destHeight;
+				if (validAccess) {
+					//EfbWrite32(pulDstTemp, sourceVal);
+					//pulDstTemp++;
+					TexOffset = CalculateTexOffsetWithYOffset16(xDst + cxIdx, TexOffsetY);
+					if (((TexOffset & 3) == 0) && ((xDst + cxIdx) & 3) < 3 && (cxTemp > 1)) {
+						// Will be writing the next pixel too, optimise to a single write from one read and one write
+						ULONG sourceVal2 = LoadToRegister32(*(PULONG)pusSrcTemp);
+						pusSrcTemp += 2;
+						NativeWriteBase32(pDestFbStart, TexOffset, Rol32(sourceVal2, 16));
+						//TexWriteRgb5652Aligned(pDestFbStart, TexOffset, sourceVal, sourceVal2);
+						cxIdx++;
+						cxTemp--;
+					} else {
+						USHORT sourceVal = (USHORT)LoadToRegister32(*pusSrcTemp);
+						pusSrcTemp++;
+						TexWriteRgb565(pDestFbStart, TexOffset, sourceVal);
+					}
+				} else {
+					pusSrcTemp++;
+				}
+				cxIdx++;
+			}
+		}
+		
+		cy--;
+		cyIdx++;
+		if (cy == 0) break;
+		pusSrc = (PUSHORT) (((PBYTE)pusSrc) + lDeltaSrc);
+		pusDst = (PUSHORT) (((PBYTE)pusDst) + lDeltaDst);
+	}
+	
+	return TRUE;
 }
 
-__attribute__((optimize("O1"))) __attribute__((noinline)) static BOOL IsRetAddrBad(PPPC_INSTRUCTION Addr) {
-	static ULONG s_RetAddrBad = 0;
-	if (s_RetAddrBad != 0) return (ULONG)Addr == s_RetAddrBad;
-	PPPC_INSTRUCTION Insn = Addr;
-	// Two instructions afterwards is beq+ ?
-	Insn += 2;
-	if (Insn->Primary_Op != BC_OP) return FALSE;
-	if (Insn->Bform_BO != 0xD) return FALSE;
-	Insn++;
-	// Next bl (within next 5 instructions) leads to "lwz r3, x(r2)" insn (or a wrapper for that)
-	PPPC_INSTRUCTION Bl = NULL;
-	for (int i = 0; i < 5; i++, Insn++) {
-		if (Insn->Primary_Op != B_OP) continue;
-		if (Insn->Iform_LK == 0) continue;
-		Bl = Insn;
-		break;
+static BOOL CopyBitsSwap8(
+SURFOBJ  *psoDest,
+SURFOBJ  *psoSrc,
+CLIPOBJ  *pco,
+XLATEOBJ *pxlo,
+RECTL    *prclDest,
+POINTL   *pptlSrc)
+{
+/*
+	Copy 8bpp colour-table indexed bitmap data endian swapped
+*/
+	
+	LONG lDeltaSrc = psoSrc->lDelta;
+	LONG lDeltaDst = psoDest->lDelta;
+	
+	if (pco != NULL &&  pco->iDComplexity != DC_TRIVIAL) {
+		return FALSE;
 	}
 	
-	if (Bl == NULL) return FALSE;
+	if (prclDest->top >= prclDest->bottom) return TRUE;
+	if (prclDest->left >= prclDest->right) return TRUE;
 	
-	Insn = (PPPC_INSTRUCTION)((ULONG)Bl + HookSignExtBranch(Bl->Iform_LI << 2));
-	if (Insn->Primary_Op == LWZ_OP && Insn->Dform_RA == 2 && Insn->Dform_RT == 3) {
-		// looks good...
-		s_RetAddrBad = (ULONG)Addr;
-		return TRUE;
+	
+	LONG xDst = prclDest->left;
+	LONG yDst = prclDest->top;
+	LONG xSrc = pptlSrc->x + xDst - prclDest->left;
+	LONG ySrc = pptlSrc->y + yDst - prclDest->top;
+	
+	LONG cx = prclDest->right - xDst;
+	LONG cy = prclDest->bottom - yDst;
+	
+	LONG xSrcStart = xSrc;
+	LONG xSrcEnd = xSrcStart + cx;
+	LONG xDstStart = xDst;
+	LONG yDstStart = prclDest->top;
+	PBYTE pjSrc = ((PBYTE) psoSrc->pvScan0) + (ySrc * lDeltaSrc);
+	PBYTE pjDst = ((PBYTE) psoDest->pvScan0) + (yDst * lDeltaDst);
+	
+	PUCHAR pucSrc = (PUCHAR) (pjSrc + (xSrcStart));
+	PUCHAR pucDst = (PUCHAR) (pjDst + (xDstStart));
+	PUCHAR pstartSrc = (PUCHAR) psoSrc->pvBits;
+	PUCHAR pendSrc = (PUCHAR) ((PUCHAR) pstartSrc + psoSrc->cjBits);
+	PUCHAR pstartDst = (PUCHAR) psoDest->pvBits;
+	PUCHAR pendDst = (PUCHAR) ((PUCHAR) pstartDst + psoDest->cjBits);
+	ULONG copyX = cx;
+	ULONG copyY = cy;
+	
+	ULONG srcHeight = psoSrc->sizlBitmap.cy;
+	ULONG srcWidth = psoSrc->sizlBitmap.cx;
+	PBYTE pSrcFbStart = ((PBYTE) psoSrc->pvScan0);
+	if (lDeltaSrc < 0) pSrcFbStart += (srcHeight * lDeltaSrc);
+	PBYTE pDestFbStart = ((PBYTE) psoDest->pvScan0);
+	ULONG destHeight = psoDest->sizlBitmap.cy;
+	ULONG destWidth = psoDest->sizlBitmap.cx;
+	if (lDeltaDst < 0) pDestFbStart += (destHeight * lDeltaDst);
+	
+	ULONG cyIdx = 0;
+	while (1) {
+		PUCHAR pucSrcTemp = pucSrc;
+		PUCHAR pucDstTemp = pucDst;
+		// Bounds check the pointers, we could be in here when drawing off the screen
+		if (pucSrc >= pstartSrc && pucDst >= pstartDst) {
+			ULONG TexOffsetY = CalculateTexYOffset8(yDstStart + cyIdx, destWidth);
+			ULONG TexOffset = 0;
+			
+			ULONG cxTemp = cx;
+			ULONG cxIdx = 0;
+			BOOLEAN validAccess;
+			// Read normally from source, write swapped to dest.
+			while (cxTemp--) {
+				validAccess = pucSrcTemp >= pstartSrc && pucDstTemp >= pstartDst &&
+					pucSrcTemp < pendSrc && pucDstTemp < pendDst &&
+					(xDst + cxIdx) < destWidth &&
+					(yDst + cyIdx) < destHeight;
+				if (validAccess) {
+					//EfbWrite32(pulDstTemp, sourceVal);
+					//pulDstTemp++;
+					TexOffset = CalculateTexOffsetWithYOffset8(xDst + cxIdx, TexOffsetY);
+					if (((TexOffset & 3) == 0) && ((xDst + cxIdx) & 7) < 5 && (cxTemp > 3)) {
+						// Writing aligned at least four pixels.
+						// Optimise to a single write
+						ULONG sourceVal32 = __builtin_bswap32(*(PULONG)pucSrcTemp);
+						pucSrcTemp += 4;
+						/*
+						sourceVal2 = (UCHAR)LoadToRegister32(*pucSrcTemp);
+						pucSrcTemp++;
+						sourceVal3 = (UCHAR)LoadToRegister32(*pucSrcTemp);
+						pucSrcTemp++;
+						UCHAR sourceVal4 = (UCHAR)LoadToRegister32(*pucSrcTemp);
+						pucSrcTemp++;
+						TexWriteCi84Aligned(pDestFbStart, TexOffset, sourceVal, sourceVal2, sourceVal3, sourceVal4);
+						*/
+						NativeWriteBase32(pDestFbStart, TexOffset, sourceVal32);
+						cxIdx += 3;
+						cxTemp -= 3;
+					} else
+					{
+						
+						UCHAR sourceVal = (UCHAR)LoadToRegister32(*pucSrcTemp);
+						USHORT sourceVal2 = 0x100, sourceVal3 = 0x100;
+						pucSrcTemp++;
+						// Read up to two more pixels where possible. (optimise to one read and one write where unaligned)
+						ULONG TexOffsetByte = TexOffset & 3;
+						if (((TexOffsetByte + 1) < 4) && (((xDst + cxIdx) & 3) < 3) && (cxTemp > 1)) {
+							sourceVal2 = (UCHAR)LoadToRegister32(*pucSrcTemp);
+							pucSrcTemp++;
+							if (((TexOffsetByte + 2) < 4) && (((xDst + cxIdx) & 3) < 2) && (cxTemp > 2)) {
+								sourceVal3 = (UCHAR)LoadToRegister32(*pucSrcTemp);
+								pucSrcTemp++;
+								cxIdx++;
+								cxTemp--;
+							}
+							cxIdx++;
+							cxTemp--;
+						}
+						TexWriteCi8(pDestFbStart, TexOffset, sourceVal, sourceVal2, sourceVal3);
+					}
+				} else {
+					pucSrcTemp++;
+				}
+				cxIdx++;
+			}
+		}
+		
+		cy--;
+		cyIdx++;
+		if (cy == 0) break;
+		pucSrc = (PUCHAR) (((PBYTE)pucSrc) + lDeltaSrc);
+		pucDst = (PUCHAR) (((PBYTE)pucDst) + lDeltaDst);
 	}
 	
-	// might be wrapping it, bl is within 16 instructions
-	Bl = NULL;
-	for (int i = 0; i < 16; i++, Insn++) {
-		if (Insn->Long == 0x4E800020) break; // blr
-		if (Insn->Primary_Op != B_OP) continue;
-		if (Insn->Iform_LK == 0) continue;
-		Bl = Insn;
-		break;
-	}
-	if (Bl == NULL) return FALSE;
-	Insn = (PPPC_INSTRUCTION)((ULONG)Bl + HookSignExtBranch(Bl->Iform_LI << 2));
-	if (Insn->Primary_Op == LWZ_OP && Insn->Dform_RA == 2 && Insn->Dform_RT == 3) {
-		// looks good...
-		s_RetAddrBad = (ULONG)Addr;
-		return TRUE;
-	}
-	
-	return FALSE;
+	return TRUE;
 }
+
+BOOL CopyBitsSwap(
+SURFOBJ  *psoDest,
+SURFOBJ  *psoSrc,
+CLIPOBJ  *pco,
+XLATEOBJ *pxlo,
+RECTL    *prclDest,
+POINTL   *pptlSrc)
+{
+	RECTL rcl;
+	
+	if (pco == NULL || pco->iDComplexity == DC_TRIVIAL) {
+		rcl.left = max(0, prclDest->left);
+		rcl.top = max(0, prclDest->top);
+		rcl.right = min(psoDest->sizlBitmap.cx, prclDest->right);
+		rcl.bottom = min(psoDest->sizlBitmap.cy, prclDest->bottom);
+	} else {
+		rcl.left = max(pco->rclBounds.left, prclDest->left);
+		rcl.top = max(pco->rclBounds.top, prclDest->top);
+		rcl.right = min(pco->rclBounds.right, prclDest->right);
+		rcl.bottom = min(pco->rclBounds.bottom, prclDest->bottom);
+	}
+	
+	if (rcl.top >= rcl.bottom) return TRUE;
+	if (rcl.left >= rcl.right) return TRUE;
+	
+	switch (psoSrc->iBitmapFormat) {
+		default:
+			return FALSE;
+		case BMF_8BPP:
+			return CopyBitsSwap8(psoDest, psoSrc, NULL, NULL, &rcl, pptlSrc);
+		case BMF_16BPP:
+			return CopyBitsSwap16(psoDest, psoSrc, NULL, NULL, &rcl, pptlSrc);
+		case BMF_32BPP:
+			return CopyBitsSwap32(psoDest, psoSrc, NULL, NULL, &rcl, pptlSrc);
+	}
+}
+
+enum {
+	STYPE_OURSURFACE = STYPE_DEVICE
+};
 
 BOOL DrvCopyBits(
 SURFOBJ  *psoDest,
@@ -246,9 +425,9 @@ POINTL   *pptlSrc)
 	to this function as a result of the following GDI functions:
 	SetDIBits, SetDIBitsToDevice, GetDIBits, SetBitmapBits, and GetBitmapBits.
 */
-	
+
 	// If both surfaces are not device managed, just call original func:
-	if (psoDest->iType != STYPE_DEVBITMAP && psoSrc->iType != STYPE_DEVBITMAP) {
+	if (psoDest->iType != STYPE_OURSURFACE && psoSrc->iType != STYPE_OURSURFACE) {
 		return EngCopyBits(psoDest, psoSrc, pco, pxlo, prclDest, pptlSrc);
 	}
 	POINTL point = {0};
@@ -257,15 +436,15 @@ POINTL   *pptlSrc)
 	
 	// Get the pdev. At least one of dest or src must be devbitmap.
 	PPDEV ppDev = NULL;
-	if (psoDest->iType == STYPE_DEVBITMAP) ppDev = (PPDEV)psoDest->dhpdev;
-	else if (psoSrc->iType == STYPE_DEVBITMAP) ppDev = (PPDEV)psoSrc->dhpdev;
+	if (psoDest->iType == STYPE_OURSURFACE) ppDev = (PPDEV)psoDest->dhpdev;
+	else if (psoSrc->iType == STYPE_OURSURFACE) ppDev = (PPDEV)psoSrc->dhpdev;
 	else {
 		// Should never get here.
 		return FALSE;
 	}
 	
 	// Both surfaces are device mapped
-	if (psoDest->iType == STYPE_DEVBITMAP && psoSrc->iType == STYPE_DEVBITMAP) {
+	if (psoDest->iType == STYPE_OURSURFACE && psoSrc->iType == STYPE_OURSURFACE) {
 		// Proxy through the double buffer.
 		psoDest = ppDev->psurfDouble;
 		psoSrc = ppDev->psurfDouble;
@@ -273,20 +452,11 @@ POINTL   *pptlSrc)
 			return FALSE;
 		}
 		psoDest = ppDev->psurfBigFb;
-		return CopyBitsSwap32(psoDest, psoSrc, NULL, NULL, prclDest, &point);
-	}
-	
-	// Try to detect CvtDFB2DIB, and fail if so.
-	// On NT 3.5x, success in that scenario causes the caller to delete the source.
-	// If that source is our device-managed surface, this CANNOT happen!
-	if (psoSrc->iType == STYPE_DEVBITMAP && psoDest->iType == STYPE_BITMAP) {
-		// Get the return address of function
-		PPPC_INSTRUCTION Insn = (PPPC_INSTRUCTION)__builtin_return_address(0);
-		if (IsRetAddrBad(Insn)) return FALSE;
+		return CopyBitsSwap(psoDest, psoSrc, pco, NULL, prclDest, &point);
 	}
 	
 	// Copying to framebuffer
-	if (psoDest->iType == STYPE_DEVBITMAP) {
+	if (psoDest->iType == STYPE_OURSURFACE) {
 		// Source is always going to be a 32bpp bitmap
 		// Proxy through the double buffer.
 		psoDest = ppDev->psurfDouble;
@@ -295,11 +465,11 @@ POINTL   *pptlSrc)
 		}
 		psoSrc = psoDest;
 		psoDest = ppDev->psurfBigFb;
-		return CopyBitsSwap32(psoDest, psoSrc, NULL, NULL, prclDest, &point);
+		return CopyBitsSwap(psoDest, psoSrc, pco, NULL, prclDest, &point);
 	}
 	
 	// Copying from framebuffer
-	if (psoSrc->iType == STYPE_DEVBITMAP) {
+	if (psoSrc->iType == STYPE_OURSURFACE) {
 		// Dest is always going to be a 32bpp bitmap
 		// Proxy through the double buffer.
 		psoSrc = ppDev->psurfDouble;
@@ -328,7 +498,7 @@ MIX        mix)
 		with any set of attributes.
 	*/
 	
-	if (pso->iType != STYPE_DEVBITMAP) {
+	if (pso->iType != STYPE_OURSURFACE) {
 		// Not device managed, call original function
 		return EngStrokePath(pso, ppo, pco, pxo, pbo, pptlBrush, pla, mix);
 	}
@@ -354,7 +524,7 @@ MIX        mix)
 	}
 	
 	// Copy back to the framebuffer
-	return CopyBitsSwap32(ppdev->psurfBigFb, ppdev->psurfDouble, NULL, NULL, &destRect, &point);
+	return CopyBitsSwap(ppdev->psurfBigFb, ppdev->psurfDouble, pco, NULL, &destRect, &point);
 }
 
 BOOL DrvTextOut(
@@ -374,7 +544,7 @@ MIX       mix)
 		render a set of glyphs at specified positions.
 	*/
 	
-	if (pso->iType != STYPE_DEVBITMAP) {
+	if (pso->iType != STYPE_OURSURFACE) {
 		// Not device managed, call original function
 		return EngTextOut(pso, pstro, pfo, pco, prclExtra, prclOpaque, pboFore, pboOpaque, pptlOrg, mix);
 	}
@@ -395,5 +565,269 @@ MIX       mix)
 	}
 	
 	// Copy back to the framebuffer
-	return CopyBitsSwap32(ppdev->psurfBigFb, ppdev->psurfDouble, NULL, NULL, &rclDest, &point);
+	return CopyBitsSwap(ppdev->psurfBigFb, ppdev->psurfDouble, NULL, NULL, &rclDest, &point);
+}
+
+BOOL DrvBitBlt(
+SURFOBJ  *psoDest,	
+SURFOBJ  *psoSrc,	
+SURFOBJ  *psoMask,	
+CLIPOBJ  *pco,	
+XLATEOBJ  *pxlo,	
+RECTL  *prclDest,	
+POINTL  *pptlSrc,	
+POINTL  *pptlMask,	
+BRUSHOBJ  *pbo,	
+POINTL  *pptlBrush,	
+ROP4  rop4	
+) {
+	/*
+		DrvBitBlt provides general bit-block transfer capabilities between device-managed surfaces,
+		between GDI-managed standard-format bitmaps, or between a device-managed surface and a GDI-managed standard-format bitmap.
+	*/
+	
+	// If both surfaces are not device managed, just call original func:
+	if (psoDest->iType != STYPE_OURSURFACE && (psoSrc == NULL || psoSrc->iType != STYPE_OURSURFACE)) {
+		return EngBitBlt(psoDest, psoSrc, psoMask, pco, pxlo, prclDest, pptlSrc, pptlMask, pbo, pptlBrush, rop4);
+	}
+	POINTL point = {0};
+	point.x = prclDest->left;
+	point.y = prclDest->top;
+	
+	// Get the pdev. At least one of dest or src must be devbitmap.
+	PPDEV ppDev = NULL;
+	if (psoDest->iType == STYPE_OURSURFACE) ppDev = (PPDEV)psoDest->dhpdev;
+	else if (psoSrc != NULL && psoSrc->iType == STYPE_OURSURFACE) ppDev = (PPDEV)psoSrc->dhpdev;
+	else {
+		// Should never get here.
+		return FALSE;
+	}
+	
+	// Both surfaces are device mapped
+	if (psoDest->iType == STYPE_OURSURFACE && (psoSrc == NULL || psoSrc->iType == STYPE_OURSURFACE)) {
+		// Proxy through the double buffer.
+		psoDest = ppDev->psurfDouble;
+		if (psoSrc != NULL) psoSrc = ppDev->psurfDouble;
+		if (!EngBitBlt(psoDest, psoSrc, psoMask, pco, pxlo, prclDest, pptlSrc, pptlMask, pbo, pptlBrush, rop4)) {
+			return FALSE;
+		}
+		psoDest = ppDev->psurfBigFb;
+		psoSrc = ppDev->psurfDouble;
+		return CopyBitsSwap(psoDest, psoSrc, pco, NULL, prclDest, &point);
+	}
+	
+	// Drawing to framebuffer
+	if (psoDest->iType == STYPE_OURSURFACE) {
+		// Source is always going to be a 32bpp bitmap
+		// Proxy through the double buffer.
+		psoDest = ppDev->psurfDouble;
+		if (!EngBitBlt(psoDest, psoSrc, psoMask, pco, pxlo, prclDest, pptlSrc, pptlMask, pbo, pptlBrush, rop4)) {
+			return FALSE;
+		}
+		psoSrc = psoDest;
+		psoDest = ppDev->psurfBigFb;
+		return CopyBitsSwap(psoDest, psoSrc, pco, NULL, prclDest, &point);
+	}
+	
+	// Drawing from framebuffer
+	if (psoSrc != NULL && psoSrc->iType == STYPE_OURSURFACE) {
+		// Dest is always going to be a 32bpp bitmap
+		// Proxy through the double buffer.
+		psoSrc = ppDev->psurfDouble;
+		return EngBitBlt(psoDest, psoSrc, psoMask, pco, pxlo, prclDest, pptlSrc, pptlMask, pbo, pptlBrush, rop4);
+	}
+	
+	// Should never get here.
+	return FALSE;
+}
+
+BOOL DrvStretchBlt(
+SURFOBJ  *psoDest,	
+SURFOBJ  *psoSrc,	
+SURFOBJ  *psoMask,	
+CLIPOBJ  *pco,	
+XLATEOBJ  *pxlo,	
+COLORADJUSTMENT  *pca,	
+POINTL  *pptlHTOrg,	
+RECTL  *prclDest,	
+RECTL  *prclSrc,	
+POINTL  *pptlMask,	
+ULONG  iMode	
+) {
+	/*
+		DrvStretchBlt provides stretching bit-block transfer capabilities between any combination of device-managed and GDI-managed surfaces.
+		This function enables the device driver to write to GDI bitmaps, especially when the driver can do halftoning.
+		This function allows the same halftoning algorithm to be applied to GDI bitmaps and device surfaces.
+	*/
+	
+	// If both surfaces are not device managed, just call original func:
+	if (psoDest->iType != STYPE_OURSURFACE && (psoSrc == NULL || psoSrc->iType != STYPE_OURSURFACE)) {
+		return EngStretchBlt(psoDest, psoSrc, psoMask, pco, pxlo, pca, pptlHTOrg, prclDest, prclSrc, pptlMask, iMode);
+	}
+	POINTL point = {0};
+	point.x = prclDest->left;
+	point.y = prclDest->top;
+	
+	// Get the pdev. At least one of dest or src must be devbitmap.
+	PPDEV ppDev = NULL;
+	if (psoDest->iType == STYPE_OURSURFACE) ppDev = (PPDEV)psoDest->dhpdev;
+	else if (psoSrc != NULL && psoSrc->iType == STYPE_OURSURFACE) ppDev = (PPDEV)psoSrc->dhpdev;
+	else {
+		// Should never get here.
+		return FALSE;
+	}
+	
+	// Both surfaces are device mapped
+	if (psoDest->iType == STYPE_OURSURFACE && (psoSrc == NULL || psoSrc->iType != STYPE_OURSURFACE)) {
+		// Proxy through the double buffer.
+		psoDest = ppDev->psurfDouble;
+		if (psoSrc != NULL) psoSrc = ppDev->psurfDouble;
+		if (!EngStretchBlt(psoDest, psoSrc, psoMask, pco, pxlo, pca, pptlHTOrg, prclDest, prclSrc, pptlMask, iMode)) {
+			return FALSE;
+		}
+		psoDest = ppDev->psurfBigFb;
+		psoSrc = ppDev->psurfDouble;
+		return CopyBitsSwap(psoDest, psoSrc, pco, NULL, prclDest, &point);
+	}
+	
+	// Drawing to framebuffer
+	if (psoDest->iType == STYPE_OURSURFACE) {
+		// Source is always going to be a 32bpp bitmap
+		// Proxy through the double buffer.
+		psoDest = ppDev->psurfDouble;
+		if (!EngStretchBlt(psoDest, psoSrc, psoMask, pco, pxlo, pca, pptlHTOrg, prclDest, prclSrc, pptlMask, iMode)) {
+			return FALSE;
+		}
+		psoSrc = psoDest;
+		psoDest = ppDev->psurfBigFb;
+		return CopyBitsSwap(psoDest, psoSrc, pco, NULL, prclDest, &point);
+	}
+	
+	// Drawing from framebuffer
+	if (psoSrc != NULL && psoSrc->iType == STYPE_OURSURFACE) {
+		// Dest is always going to be a 32bpp bitmap
+		// Proxy through the double buffer.
+		psoSrc = ppDev->psurfDouble;
+		return EngStretchBlt(psoDest, psoSrc, psoMask, pco, pxlo, pca, pptlHTOrg, prclDest, prclSrc, pptlMask, iMode);
+	}
+	
+	// Should never get here.
+	return FALSE;
+}
+
+BOOL DrvPaint(
+SURFOBJ  *pso,	
+CLIPOBJ  *pco,	
+BRUSHOBJ  *pbo,	
+POINTL  *pptlBrushOrg,	
+MIX  mix	
+) {
+	/*
+		DrvPaint paints a specified region. This function is required if any drawing is to be done on a device-managed surface.
+	*/
+	
+	if (pso->iType != STYPE_OURSURFACE) {
+		return EngPaint(pso, pco, pbo, pptlBrushOrg, mix);
+	}
+	
+	PPDEV ppdev = (PPDEV)pso->dhpdev;
+	
+	// Call via the double buffer
+	if (!EngPaint(ppdev->psurfDouble, pco, pbo, pptlBrushOrg, mix)) {
+		return FALSE;
+	}
+	
+	POINTL point = {0};
+	point.x = pco->rclBounds.left;
+	point.y = pco->rclBounds.top;
+	
+	// Copy back to the framebuffer
+	return CopyBitsSwap(ppdev->psurfBigFb, ppdev->psurfDouble, pco, NULL, &pco->rclBounds, &point);
+}
+
+BOOL DrvFillPath(
+SURFOBJ  *pso,	
+PATHOBJ  *ppo,	
+CLIPOBJ  *pco,	
+BRUSHOBJ  *pbo,	
+POINTL  *pptlBrushOrg,	
+MIX  mix,	
+FLONG  flOptions	
+) {
+	/*
+		DrvFillPath is an optional entry point to handle the filling of closed paths.
+	*/
+	
+	if (pso->iType != STYPE_OURSURFACE) {
+		return EngFillPath(pso, ppo, pco, pbo, pptlBrushOrg, mix, flOptions);
+	}
+	
+	PPDEV ppdev = (PPDEV)pso->dhpdev;
+	
+	// Call via the double buffer
+	if (!EngFillPath(ppdev->psurfDouble, ppo, pco, pbo, pptlBrushOrg, mix, flOptions)) {
+		return FALSE;
+	}
+	
+	// Get the path bounds, convert it into a rect
+	RECTFX PathBounds;
+	RECTL destRect;
+	PATHOBJ_vGetBounds(ppo, &PathBounds);
+	destRect.left = (PathBounds.xLeft >> 4);
+	destRect.top = (PathBounds.yTop >> 4);
+	destRect.right = (PathBounds.xRight >> 4) + 2;
+	destRect.bottom = (PathBounds.yBottom >> 4) + 2;
+	EngDeletePath(ppo);
+	
+	POINTL point = {0};
+	point.x = destRect.left;
+	point.y = destRect.top;
+	
+	// Copy back to the framebuffer
+	return CopyBitsSwap(ppdev->psurfBigFb, ppdev->psurfDouble, pco, NULL, &destRect, &point);
+}
+
+BOOL DrvStrokeAndFillPath(
+SURFOBJ  *pso,	
+PATHOBJ  *ppo,	
+CLIPOBJ  *pco,	
+XFORMOBJ  *pxo,	
+BRUSHOBJ  *pboStroke,	
+LINEATTRS  *plineattrs,	
+BRUSHOBJ  *pboFill,	
+POINTL  *pptlBrushOrg,	
+MIX  mixFill,	
+FLONG  flOptions	
+) {
+	/*
+		DrvStrokeAndFillPath fills and strokes a path concurrently.
+	*/
+	
+	if (pso->iType != STYPE_OURSURFACE) {
+		// Not device managed, call original function
+		return EngStrokeAndFillPath(pso, ppo, pco, pxo, pboStroke, plineattrs, pboFill, pptlBrushOrg, mixFill, flOptions);
+	}
+	
+	PPDEV ppdev = (PPDEV)pso->dhpdev;
+	
+	// Get the path bounds, convert it into a rect
+	RECTFX PathBounds;
+	RECTL destRect;
+	PATHOBJ_vGetBounds(ppo, &PathBounds);
+	destRect.left = (PathBounds.xLeft >> 4);
+	destRect.top = (PathBounds.yTop >> 4);
+	destRect.right = (PathBounds.xRight >> 4) + 2;
+	destRect.bottom = (PathBounds.yBottom >> 4) + 2;
+	
+	POINTL point = {0};
+	point.x = destRect.left;
+	point.y = destRect.top;
+	
+	// Call via the double buffer
+	if (!EngStrokeAndFillPath(ppdev->psurfDouble, ppo, pco, pxo, pboStroke, plineattrs, pboFill, pptlBrushOrg, mixFill, flOptions)) {
+		return FALSE;
+	}
+	
+	// Copy back to the framebuffer
+	return CopyBitsSwap(ppdev->psurfBigFb, ppdev->psurfDouble, pco, NULL, &destRect, &point);
 }

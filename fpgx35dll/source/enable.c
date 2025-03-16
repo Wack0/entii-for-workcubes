@@ -32,7 +32,13 @@ static DRVFN gadrvfn[] =
     // For the big endian device support we need to add some more implementations
     {   INDEX_DrvCopyBits,              (PFN) DrvCopyBits           },
     {   INDEX_DrvStrokePath,            (PFN) DrvStrokePath         },
-    {   INDEX_DrvTextOut,               (PFN) DrvTextOut            }
+    {   INDEX_DrvTextOut,               (PFN) DrvTextOut            },
+
+	{   INDEX_DrvBitBlt,                (PFN) DrvBitBlt             },
+	{   INDEX_DrvStretchBlt,            (PFN) DrvStretchBlt         },
+	{   INDEX_DrvPaint,                 (PFN) DrvPaint              },
+	{   INDEX_DrvFillPath,              (PFN) DrvFillPath           },
+	{   INDEX_DrvStrokeAndFillPath,     (PFN) DrvStrokeAndFillPath  },
 };
 
 // Define the functions you want to hook for 8/16/24/32 pel formats
@@ -329,9 +335,15 @@ DHPDEV dhpdev)
 	SIZEL sizl;
 	sizl.cx = ppdev->cxScreen;
 	sizl.cy = ppdev->cyScreen;
-	hsurf = (HSURF)EngCreateDeviceBitmap((DHSURF) ppdev, sizl, ulBitmapType);
+	hsurf = (HSURF)EngCreateDeviceSurface((DHSURF) ppdev, sizl, ulBitmapType);
 	// Tell GDI that functions needs hooked when dealing with this surface.
-	flHooks |= HOOK_COPYBITS | HOOK_STROKEPATH | HOOK_TEXTOUT;
+	flHooks |= HOOK_COPYBITS | HOOK_STROKEPATH | HOOK_TEXTOUT | HOOK_PAINT | HOOK_BITBLT
+	
+#if 0 // Some of these are broken, TODO: enable when tested working
+		 | HOOK_STRETCHBLT | HOOK_FILLPATH
+		 | HOOK_STROKEANDFILLPATH
+#endif
+		;
 	}
 
     if (!EngAssociateSurface(hsurf, ppdev->hdevEng, flHooks))
@@ -360,11 +372,11 @@ DHPDEV dhpdev)
 {
 	PPDEV ppdev = (PPDEV)dhpdev;
     if (ppdev->bIsBigEndian) {
-	EngUnlockSurface(ppdev->psurfBigFb);
-	EngUnlockSurface(ppdev->psurfDouble);
-	EngDeleteSurface(ppdev->hsurfDouble);
+		EngUnlockSurface(ppdev->psurfBigFb);
+		EngUnlockSurface(ppdev->psurfDouble);
+		EngDeleteSurface(ppdev->hsurfDouble);
     }
-    EngDeleteSurface(((PPDEV) dhpdev)->hsurfEng);
+	EngDeleteSurface(((PPDEV) dhpdev)->hsurfEng);
     vDisableSURF((PPDEV) dhpdev);
     ((PPDEV) dhpdev)->hsurfEng = (HSURF) 0;
 }

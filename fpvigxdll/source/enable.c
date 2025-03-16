@@ -29,10 +29,23 @@ static DRVFN gadrvfn[] =
     {   INDEX_DrvDitherColor,           (PFN) DrvDitherColor        },
     {   INDEX_DrvDitherColor,           (PFN) DrvDitherColor        },
     {   INDEX_DrvGetModes,              (PFN) DrvGetModes           },
+#if 0
+	// DirectDraw functions
+	{   INDEX_DrvGetDirectDrawInfo,     (PFN) DrvGetDirectDrawInfo  },
+	{   INDEX_DrvEnableDirectDraw,      (PFN) DrvEnableDirectDraw   },
+	{   INDEX_DrvDisableDirectDraw,     (PFN) DrvDisableDirectDraw  },
+#endif
     // For the big endian device support we need to add some more implementations
     {   INDEX_DrvCopyBits,              (PFN) DrvCopyBits           },
     {   INDEX_DrvStrokePath,            (PFN) DrvStrokePath         },
-    {   INDEX_DrvTextOut,               (PFN) DrvTextOut            }
+    {   INDEX_DrvTextOut,               (PFN) DrvTextOut            },
+
+	{   INDEX_DrvBitBlt,                (PFN) DrvBitBlt             },
+	{   INDEX_DrvStretchBlt,            (PFN) DrvStretchBlt         },
+	{   INDEX_DrvPaint,                 (PFN) DrvPaint              },
+	{   INDEX_DrvFillPath,              (PFN) DrvFillPath           },
+	{   INDEX_DrvStrokeAndFillPath,     (PFN) DrvStrokeAndFillPath  },
+	{   INDEX_DrvLineTo,                (PFN) DrvLineTo             }
 };
 
 // Define the functions you want to hook for 8/16/24/32 pel formats
@@ -252,11 +265,13 @@ DHPDEV dhpdev)
         flHooks = HOOKS_BMF32BPP;
     }
 	
+#if 0
 	// For big endian displays we will only support 32bpp so ensure that now.
 	if (ulBitmapType != BMF_32BPP && ppdev->bIsBigEndian) {
 		RIP("DISP DrvEnableSurface big endian display but not 32bpp\n");
 		return(FALSE);
 	}
+#endif
 
     hsurf = (HSURF) EngCreateBitmap(sizl,
                                     ppdev->lDeltaScreen,
@@ -286,7 +301,7 @@ DHPDEV dhpdev)
 		ppdev->lDeltaScreen,
 		ulBitmapType,
 		(ppdev->lDeltaScreen > 0) ? BMF_TOPDOWN : 0,
-		NULL
+		ppdev->pjBitmap
 	);
 	if (ppdev->hsurfDouble == 0) {
 		RIP("DISP DrvEnableSurface could not create double-buffered surface handle\n");
@@ -313,12 +328,51 @@ DHPDEV dhpdev)
 		return FALSE;
 	}
 	// Create a dummy ddb which will internally cover the framebuffer.
+#if 1
 	SIZEL sizl;
 	sizl.cx = ppdev->cxScreen;
 	sizl.cy = ppdev->cyScreen;
-	hsurf = (HSURF)EngCreateDeviceBitmap((DHSURF) ppdev, sizl, ulBitmapType);
+	//hsurf = (HSURF)EngCreateDeviceBitmap((DHSURF) ppdev, sizl, ulBitmapType);
+	hsurf = (HSURF)EngCreateDeviceSurface((DHSURF) ppdev, sizl, ulBitmapType);
+#else
+	HSURF hsurf2 = (HSURF) EngCreateBitmap(sizl,
+                                    ppdev->lDeltaScreen,
+                                    ulBitmapType,
+                                    (ppdev->lDeltaScreen > 0) ? BMF_TOPDOWN : 0,
+                                        (PVOID) (ppdev->pjScreen));
+	if (hsurf2 == 0) {
+		RIP("DISP DrvEnableSurface could not create second bitmap\n");
+		EngUnlockSurface(ppdev->psurfDouble);
+		EngUnlockSurface(ppdev->psurfBigFb);
+		EngDeleteSurface(ppdev->hsurfDouble);
+		EngDeleteSurface(hsurf);
+		return FALSE;
+	}
+	{
+	SURFOBJ* pSurf = EngLockSurface(hsurf2);
+	if (pSurf == NULL) {
+		RIP("DISP DrvEnableSurface could not lock second bitmap\n");
+		EngDeleteSurface(hsurf2);
+		EngUnlockSurface(ppdev->psurfDouble);
+		EngUnlockSurface(ppdev->psurfBigFb);
+		EngDeleteSurface(ppdev->hsurfDouble);
+		EngDeleteSurface(hsurf);
+		return FALSE;
+	}
+	pSurf->dhsurf = (DHSURF)STYPE_DEVBITMAP;
+	EngUnlockSurface(pSurf);
+	}
+#endif
+	
+
 	// Tell GDI that functions needs hooked when dealing with this surface.
-	flHooks |= HOOK_COPYBITS | HOOK_STROKEPATH | HOOK_TEXTOUT;
+	flHooks |= HOOK_COPYBITS | HOOK_STROKEPATH | HOOK_TEXTOUT | HOOK_PAINT | HOOK_BITBLT
+	
+#if 0 // Some of these are broken, TODO: enable when tested working
+		 | HOOK_STRETCHBLT | HOOK_FILLPATH
+		 | HOOK_STROKEANDFILLPATH | HOOK_LINETO
+#endif
+		;
 	}
 
     if (!EngAssociateSurface(hsurf, ppdev->hdevEng, flHooks))
@@ -345,11 +399,12 @@ DHPDEV dhpdev)
 {
 	PPDEV ppdev = (PPDEV)dhpdev;
     if (ppdev->bIsBigEndian) {
-	EngUnlockSurface(ppdev->psurfBigFb);
-	EngUnlockSurface(ppdev->psurfDouble);
-	EngDeleteSurface(ppdev->hsurfDouble);
+		EngUnlockSurface(ppdev->psurfBigFb);
+		EngUnlockSurface(ppdev->psurfDouble);
+		EngDeleteSurface(ppdev->hsurfDouble);
     }
-    EngDeleteSurface(((PPDEV) dhpdev)->hsurfEng);
+	EngDeleteSurface(((PPDEV) dhpdev)->hsurfEng);
+	
     vDisableSURF((PPDEV) dhpdev);
     ((PPDEV) dhpdev)->hsurfEng = (HSURF) 0;
 }
@@ -373,6 +428,8 @@ BOOL bEnable)
         //
         // The screen must be reenabled, reinitialize the device to clean state.
         //
+		
+		if (ppdev->hsurfEng == 0) return FALSE;
 
         return (bInitSURF(ppdev, FALSE));
     }

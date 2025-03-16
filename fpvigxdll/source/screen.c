@@ -7,6 +7,7 @@
 \**************************************************************************/
 
 #include "driver.h"
+#include "../../fpvigxdrv/source/ioctl.h"
 
 #define SYSTM_LOGFONT {16,7,0,0,700,0,0,0,ANSI_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,DEFAULT_QUALITY,VARIABLE_PITCH | FF_DONTCARE,L"System"}
 #define HELVE_LOGFONT {12,9,0,0,400,0,0,0,ANSI_CHARSET,OUT_DEFAULT_PRECIS,CLIP_STROKE_PRECIS,PROOF_QUALITY,VARIABLE_PITCH | FF_DONTCARE,L"MS Sans Serif"}
@@ -89,6 +90,22 @@ BOOL bInitSURF(PPDEV ppdev, BOOL bFirst)
         }
 
         ppdev->cScreenSize = videoMemoryInformation.VideoRamLength;
+		
+		// Additionally, get the pointer to the bitmap that the display miniport allocated.
+		videoMemory.RequestedVirtualAddress = NULL;
+		if (EngDeviceIoControl(ppdev->hDriver,
+                               IOCTL_VIDEO_GET_BITMAP_BUFFER,
+                               &videoMemory,
+                               sizeof(VIDEO_MEMORY),
+                               &videoMemoryInformation,
+                               sizeof(VIDEO_MEMORY_INFORMATION),
+                               &returnedDataLength))
+		{
+			RIP("DISP bInitSURF failed IOCTL_VIDEO_GET_BITMAP_BUFFER\n");
+			return(FALSE);
+		}
+		
+		ppdev->pjBitmap = (PBYTE)(videoMemoryInformation.FrameBufferBase);
 
         //
         // Initialize the head of the offscreen list to NULL.
