@@ -1338,7 +1338,7 @@ VP_STATUS ViStartIoImpl(PDEVICE_EXTENSION Extension, PVIDEO_REQUEST_PACKET Reque
 			if (Extension->SetupddLoaded) ModeCount = 1;
 			if (RequestPacket->OutputBufferLength < (sizeof(VIDEO_MODE_INFORMATION) * ModeCount)) return ERROR_INSUFFICIENT_BUFFER;
 			RequestPacket->StatusBlock->Information = sizeof(VIDEO_MODE_INFORMATION) * ModeCount;
-			RtlCopyMemory(RequestPacket->OutputBuffer, s_VideoModes, sizeof(s_VideoModes));
+			RtlCopyMemory(RequestPacket->OutputBuffer, s_VideoModes, sizeof(VIDEO_MODE_INFORMATION) * ModeCount);
 #if 0
 			if (!Extension->SetupddLoaded) {
 				PVIDEO_MODE_INFORMATION OutputInfo = (PVIDEO_MODE_INFORMATION)RequestPacket->OutputBuffer;
