@@ -391,6 +391,7 @@ RECTL    *prclDest,
 POINTL   *pptlSrc)
 {
 	RECTL rcl;
+	POINTL point = {0};
 	
 	if (pco == NULL || pco->iDComplexity == DC_TRIVIAL) {
 		rcl.left = max(0, prclDest->left);
@@ -406,6 +407,12 @@ POINTL   *pptlSrc)
 	
 	if (rcl.top >= rcl.bottom) return TRUE;
 	if (rcl.left >= rcl.right) return TRUE;
+	
+	if (pptlSrc == NULL) {
+		pptlSrc = &point;
+		point.x = rcl.left;
+		point.y = rcl.top;
+	}
 	
 	switch (psoSrc->iBitmapFormat) {
 		default:
@@ -454,9 +461,6 @@ POINTL   *pptlSrc)
 	if (psoDest->iType != STYPE_OURSURFACE && psoSrc->iType != STYPE_OURSURFACE) {
 		return EngCopyBits(psoDest, psoSrc, pco, pxlo, prclDest, pptlSrc);
 	}
-	POINTL point = {0};
-	point.x = prclDest->left;
-	point.y = prclDest->top;
 	
 	// Get the pdev. At least one of dest or src must be devbitmap.
 	PPDEV ppDev = NULL;
@@ -476,7 +480,7 @@ POINTL   *pptlSrc)
 			return FALSE;
 		}
 		psoDest = ppDev->psurfBigFb;
-		return CopyBitsSwap(psoDest, psoSrc, pco, NULL, prclDest, &point);
+		return CopyBitsSwap(psoDest, psoSrc, pco, NULL, prclDest, NULL);
 	}
 	
 	// Copying to framebuffer
@@ -489,7 +493,7 @@ POINTL   *pptlSrc)
 		}
 		psoSrc = psoDest;
 		psoDest = ppDev->psurfBigFb;
-		return CopyBitsSwap(psoDest, psoSrc, pco, NULL, prclDest, &point);
+		return CopyBitsSwap(psoDest, psoSrc, pco, NULL, prclDest, NULL);
 	}
 	
 	// Copying from framebuffer
@@ -538,17 +542,13 @@ MIX        mix)
 	destRect.right = (PathBounds.xRight >> 4) + 2;
 	destRect.bottom = (PathBounds.yBottom >> 4) + 2;
 	
-	POINTL point = {0};
-	point.x = destRect.left;
-	point.y = destRect.top;
-	
 	// Call via the double buffer
 	if (!EngStrokePath(ppdev->psurfDouble, ppo, pco, pxo, pbo, pptlBrush, pla, mix)) {
 		return FALSE;
 	}
 	
 	// Copy back to the framebuffer
-	return CopyBitsSwap(ppdev->psurfBigFb, ppdev->psurfDouble, pco, NULL, &destRect, &point);
+	return CopyBitsSwap(ppdev->psurfBigFb, ppdev->psurfDouble, pco, NULL, &destRect, NULL);
 }
 
 BOOL DrvTextOut(
@@ -576,12 +576,9 @@ MIX       mix)
 	// Copy to the double buffer
 	RECTL* prclDest = (prclOpaque != NULL) ? prclOpaque : &pstro->rclBkGround;
 	PPDEV ppdev = (PPDEV)pso->dhpdev;
-	POINTL point = {0};
 	
 	RECTL rclDest;
 	memcpy(&rclDest, prclDest, sizeof(rclDest));
-	point.x = prclDest->left;
-	point.y = prclDest->top;
 	
 	// Call via the double buffer
 	if (!EngTextOut(ppdev->psurfDouble, pstro, pfo, pco, prclExtra, prclOpaque, pboFore, pboOpaque, pptlOrg, mix)) {
@@ -589,7 +586,7 @@ MIX       mix)
 	}
 	
 	// Copy back to the framebuffer
-	return CopyBitsSwap(ppdev->psurfBigFb, ppdev->psurfDouble, NULL, NULL, &rclDest, &point);
+	return CopyBitsSwap(ppdev->psurfBigFb, ppdev->psurfDouble, pco, NULL, &rclDest, NULL);
 }
 
 BOOL DrvBitBlt(
@@ -614,9 +611,6 @@ ROP4  rop4
 	if (psoDest->iType != STYPE_OURSURFACE && (psoSrc == NULL || psoSrc->iType != STYPE_OURSURFACE)) {
 		return EngBitBlt(psoDest, psoSrc, psoMask, pco, pxlo, prclDest, pptlSrc, pptlMask, pbo, pptlBrush, rop4);
 	}
-	POINTL point = {0};
-	point.x = prclDest->left;
-	point.y = prclDest->top;
 	
 	// Get the pdev. At least one of dest or src must be devbitmap.
 	PPDEV ppDev = NULL;
@@ -637,7 +631,7 @@ ROP4  rop4
 		}
 		psoDest = ppDev->psurfBigFb;
 		psoSrc = ppDev->psurfDouble;
-		return CopyBitsSwap(psoDest, psoSrc, pco, NULL, prclDest, &point);
+		return CopyBitsSwap(psoDest, psoSrc, pco, NULL, prclDest, NULL);
 	}
 	
 	// Drawing to framebuffer
@@ -650,7 +644,7 @@ ROP4  rop4
 		}
 		psoSrc = psoDest;
 		psoDest = ppDev->psurfBigFb;
-		return CopyBitsSwap(psoDest, psoSrc, pco, NULL, prclDest, &point);
+		return CopyBitsSwap(psoDest, psoSrc, pco, NULL, prclDest, NULL);
 	}
 	
 	// Drawing from framebuffer
@@ -688,9 +682,6 @@ ULONG  iMode
 	if (psoDest->iType != STYPE_OURSURFACE && (psoSrc == NULL || psoSrc->iType != STYPE_OURSURFACE)) {
 		return EngStretchBlt(psoDest, psoSrc, psoMask, pco, pxlo, pca, pptlHTOrg, prclDest, prclSrc, pptlMask, iMode);
 	}
-	POINTL point = {0};
-	point.x = prclDest->left;
-	point.y = prclDest->top;
 	
 	// Get the pdev. At least one of dest or src must be devbitmap.
 	PPDEV ppDev = NULL;
@@ -711,7 +702,7 @@ ULONG  iMode
 		}
 		psoDest = ppDev->psurfBigFb;
 		psoSrc = ppDev->psurfDouble;
-		return CopyBitsSwap(psoDest, psoSrc, pco, NULL, prclDest, &point);
+		return CopyBitsSwap(psoDest, psoSrc, pco, NULL, prclDest, NULL);
 	}
 	
 	// Drawing to framebuffer
@@ -724,7 +715,7 @@ ULONG  iMode
 		}
 		psoSrc = psoDest;
 		psoDest = ppDev->psurfBigFb;
-		return CopyBitsSwap(psoDest, psoSrc, pco, NULL, prclDest, &point);
+		return CopyBitsSwap(psoDest, psoSrc, pco, NULL, prclDest, NULL);
 	}
 	
 	// Drawing from framebuffer
@@ -761,12 +752,8 @@ MIX  mix
 		return FALSE;
 	}
 	
-	POINTL point = {0};
-	point.x = pco->rclBounds.left;
-	point.y = pco->rclBounds.top;
-	
 	// Copy back to the framebuffer
-	return CopyBitsSwap(ppdev->psurfBigFb, ppdev->psurfDouble, pco, NULL, &pco->rclBounds, &point);
+	return CopyBitsSwap(ppdev->psurfBigFb, ppdev->psurfDouble, pco, NULL, &pco->rclBounds, NULL);
 }
 
 BOOL DrvFillPath(
@@ -803,12 +790,8 @@ FLONG  flOptions
 	destRect.bottom = (PathBounds.yBottom >> 4) + 2;
 	EngDeletePath(ppo);
 	
-	POINTL point = {0};
-	point.x = destRect.left;
-	point.y = destRect.top;
-	
 	// Copy back to the framebuffer
-	return CopyBitsSwap(ppdev->psurfBigFb, ppdev->psurfDouble, pco, NULL, &destRect, &point);
+	return CopyBitsSwap(ppdev->psurfBigFb, ppdev->psurfDouble, pco, NULL, &destRect, NULL);
 }
 
 BOOL DrvStrokeAndFillPath(
@@ -843,17 +826,13 @@ FLONG  flOptions
 	destRect.right = (PathBounds.xRight >> 4) + 2;
 	destRect.bottom = (PathBounds.yBottom >> 4) + 2;
 	
-	POINTL point = {0};
-	point.x = destRect.left;
-	point.y = destRect.top;
-	
 	// Call via the double buffer
 	if (!EngStrokeAndFillPath(ppdev->psurfDouble, ppo, pco, pxo, pboStroke, plineattrs, pboFill, pptlBrushOrg, mixFill, flOptions)) {
 		return FALSE;
 	}
 	
 	// Copy back to the framebuffer
-	return CopyBitsSwap(ppdev->psurfBigFb, ppdev->psurfDouble, pco, NULL, &destRect, &point);
+	return CopyBitsSwap(ppdev->psurfBigFb, ppdev->psurfDouble, pco, NULL, &destRect, NULL);
 }
 
 BOOL DrvLineTo(
@@ -878,15 +857,11 @@ BOOL DrvLineTo(
 	
 	PPDEV ppdev = (PPDEV)pso->dhpdev;
 	
-	POINTL point = {0};
-	point.x = prclBounds->left;
-	point.y = prclBounds->top;
-	
 	// Call via the double buffer
 	if (!EngLineTo(ppdev->psurfDouble, pco, pbo, x1, y1, x2, y1, prclBounds, mix)) {
 		return FALSE;
 	}
 	
 	// Can probably optimise this more since this is drawing a line, but anyway...
-	return CopyBitsSwap(ppdev->psurfBigFb, ppdev->psurfDouble, pco, NULL, prclBounds, &point);
+	return CopyBitsSwap(ppdev->psurfBigFb, ppdev->psurfDouble, pco, NULL, prclBounds, NULL);
 }
