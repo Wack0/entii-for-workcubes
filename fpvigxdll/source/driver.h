@@ -28,6 +28,7 @@ typedef struct  _PDEV
     SURFOBJ* psurfDouble;               // Pointer to framebuffer copy where bIsBigEndian==true
     HPALETTE hpalDefault;               // Handle to the default palette for device.
     PBYTE   pjScreen;                   // This is pointer to base screen address
+	PBYTE   pjBitmap;                   // This is a pointer to the bitmap that the driver allocated for us to draw into
     ULONG   cxScreen;                   // Visible screen width
     ULONG   cyScreen;                   // Visible screen height
     ULONG   ulMode;                     // Mode the mini-port driver is in.
@@ -47,6 +48,7 @@ typedef struct  _PDEV
     PVIDEO_POINTER_ATTRIBUTES pPointerAttributes; // hardware pointer attributes
     DWORD   cjPointerAttributes;        // Size of buffer allocated
     PALETTEENTRY *pPal;                 // If this is pal managed, this is the pal
+	PVOID   pLockedSurface;             // If ddraw surface is locked down this is the pointer to it
     BOOL    fHwCursorActive;            // Are we currently using the hw cursor
     BOOL    bSupportDCI;                // Does the miniport support DCI?
     BOOL    bIsBigEndian;               // Vram is mapped big endian and so needs swaps done

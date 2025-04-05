@@ -27,6 +27,8 @@ extern ULONG NtBuildNumber;
 #include "efb.h"
 #include "cp.h"
 #include "vi.h"
+#include "ioctl.h"
+#include "texdraw.h"
 
 // Only define this if testing the GDI-specific codepaths under setupdd
 //#define SETUPDD_TEST
@@ -47,8 +49,14 @@ typedef struct _DEVICE_EXTENSION {
 	PULONG DoubleFrameBufferAlloc;
 	PULONG DoubleFrameBuffer;
 	ULONG DoubleFrameBufferPhys;
+	PULONG BankBufferAlloc;
+	PULONG BankBuffer;
+	ULONG BankBufferPhys;
+	ULONG BankCurrent;
+	PULONG BitmapBuffer;
 	PUSHORT ArrayVerticies;
 	ULONG ArrayVerticiesPhys;
+	ULONG VideoModeIndex;
 	KDPC TimerDpc;
 	KTIMER Timer;
 	//BOOLEAN InIoSpace;
@@ -63,7 +71,36 @@ enum {
 	DOUBLE_FRAMEBUFFER_LENGTH = DOUBLE_FRAMEBUFFER_HEIGHT * DOUBLE_FRAMEBUFFER_STRIDE
 };
 
-static VIDEO_MODE_INFORMATION s_VideoMode = {0};
+enum {
+	VIDEO_MODE_480P32,
+	VIDEO_MODE_480P16,
+	VIDEO_MODE_480P8,
+	VIDEO_MODE_240P32,
+	VIDEO_MODE_240P16,
+	VIDEO_MODE_240P8,
+	VIDEO_MODE_COUNT
+};
+
+enum {
+	COLOUR_DEPTH_32,
+	COLOUR_DEPTH_16,
+	COLOUR_DEPTH_8,
+	COLOUR_DEPTH_COUNT
+};
+
+enum {
+	RESOLUTION_480P,
+	RESOLUTION_240P,
+	RESOLUTION_COUNT
+};
+
+enum {
+	COLOUR_TABLE_OFFSET = (DOUBLE_FRAMEBUFFER_WIDTH * DOUBLE_FRAMEBUFFER_HEIGHT) * 2
+};
+
+#define VideoModeFromResolutionAndDepth(Res, Depth) (((ULONG)(Res) * (ULONG)COLOUR_DEPTH_COUNT) + (ULONG)(Depth))
+
+static VIDEO_MODE_INFORMATION s_VideoModes[VIDEO_MODE_COUNT] = {0};
 
 // Use the pixel engine to copy the embedded framebuffer to the video interface framebuffer.
 // Ensure the GPU registers are initialised for the copy.
@@ -276,6 +313,25 @@ static void PepCopyBeDoubleBufferToEfb(PDEVICE_EXTENSION Extension) {
 	// Not actually needed as the double buffer is always mapped uncached.
 	//HalSweepDcacheRange(Extension->DoubleFrameBuffer, DOUBLE_FRAMEBUFFER_LENGTH);
 	
+	// Initialise variables based on the set display mode.
+	ULONG ModeIndex = Extension->VideoModeIndex;
+	ULONG Format;
+	// For an invalid mode default to 640x480x32
+	if (ModeIndex >= VIDEO_MODE_COUNT) ModeIndex = VIDEO_MODE_480P32;
+	switch (ModeIndex % COLOUR_DEPTH_COUNT) {
+		case COLOUR_DEPTH_32:
+		default:
+			Format = 6; // RGBA8
+			break;
+		case COLOUR_DEPTH_16:
+			Format = 4; // RGB565
+			break;
+		case COLOUR_DEPTH_8:
+			Format = 9; // Colour index 8-bit
+			//Format = 10; // Colour index 14-bit
+			break;
+	}
+	
 	ULONG NumberOfBytesWritten = 0;
 	// Invalidate vertex cache.
 	CppWrite8(0x48);
@@ -294,6 +350,192 @@ static void PepCopyBeDoubleBufferToEfb(PDEVICE_EXTENSION Extension) {
 	CppWrite8(0xA0);
 	CppWrite32(Extension->ArrayVerticiesPhys);
 	NumberOfBytesWritten += 6;
+	// For CI8, set up the colour table, texture stages etc
+	if (Format >= 9) {
+		CppWriteBpReg(BPMEM_IND_IMASK);
+		NumberOfBytesWritten += 5;
+		// First set of palette entries (r,g)
+		// Physical address.
+		CppWriteBpReg(
+			BPMEM_LOADTLUT0 |
+			((Extension->DoubleFrameBufferPhys + COLOUR_TABLE_OFFSET) >> 5)
+		);
+		NumberOfBytesWritten += 5;
+		// TMEM offset, length
+		CppWriteBpReg(
+			BPMEM_LOADTLUT1 |
+			(0x200 << 0) | // TMEM offset : ((0xC0000 - 0x80000) >> 9)
+			(0x10 << 10)   // Texture count: 256 entries
+		);
+		NumberOfBytesWritten += 5;
+		CppWriteBpReg(BPMEM_IND_IMASK);
+		NumberOfBytesWritten += 5;
+		// Second set of palette entries (b)
+		// Physical address.
+		CppWriteBpReg(
+			BPMEM_LOADTLUT0 |
+			((Extension->DoubleFrameBufferPhys + COLOUR_TABLE_OFFSET + 0x200) >> 5)
+		);
+		NumberOfBytesWritten += 5;
+		// TMEM offset, length
+		CppWriteBpReg(
+			BPMEM_LOADTLUT1 |
+			(0x210 << 0) | // TMEM offset : ((0xC2000 - 0x80000) >> 9)
+			(0x10 << 10)   // Texture count: 256 entries
+		);
+		NumberOfBytesWritten += 5;
+		CppWriteBpReg(BPMEM_IND_IMASK);
+		NumberOfBytesWritten += 5;
+		// Set up the texture dma for the second engine.
+		CppWriteBpReg(
+			(BPMEM_TX_SETMODE0 + (1 << 24)) |
+			(1 << 4) |
+			(4 << 5)
+		);
+		NumberOfBytesWritten += 5;
+		CppWriteBpReg(BPMEM_TX_SETMODE1 + (1 << 24)); // no lod set
+		NumberOfBytesWritten += 5;
+		CppWriteBpReg(
+			(BPMEM_TX_SETIMAGE0 + (1 << 24)) |
+			((640 - 1) << 0) | // width
+			((480 - 1) << 10) | // height
+			(Format << 20)
+		);
+		NumberOfBytesWritten += 5;
+		CppWriteBpReg(
+			(BPMEM_TX_SETIMAGE1 + (1 << 24)) |
+			0x800 |     // even tmem line
+			(3 << 15) | // even tmem width?
+			(3 << 18)   // even tmem height?
+		);
+		NumberOfBytesWritten += 5;
+		CppWriteBpReg(
+			(BPMEM_TX_SETIMAGE2 + (1 << 24)) |
+			0xC00 |     // odd tmem line
+			(3 << 15) | // odd tmem width?
+			(3 << 18)   // odd tmem height?
+		);
+		NumberOfBytesWritten += 5;
+		CppWriteBpReg((BPMEM_TX_SETIMAGE3 + (1 << 24)) |
+			(Extension->DoubleFrameBufferPhys >> 5)
+		);
+		NumberOfBytesWritten += 5;
+		CppWriteBpReg((BPMEM_TX_SETTLUT + (1 << 24)) |
+			(0x210 << 0) | // TMEM offset : ((0xC2000 - 0x80000) >> 9)
+			(0 << 10)      // Format: IA8
+		);
+		NumberOfBytesWritten += 5;
+		// Texture colour: ar,gb
+		CppWriteBpReg((BPMEM_TEV_COLOR_RA + (2 << 24)) |
+			0x00FF
+		);
+		NumberOfBytesWritten += 5;
+		CppWriteBpReg((BPMEM_TEV_COLOR_BG + (2 << 24)) |
+			0xFF000
+		);
+		NumberOfBytesWritten += 5;
+		// Needs two more dummy loads for some reason (hardware bug workaround?)
+		CppWriteBpReg((BPMEM_TEV_COLOR_BG + (2 << 24)) |
+			0xFF000
+		);
+		NumberOfBytesWritten += 5;
+		CppWriteBpReg((BPMEM_TEV_COLOR_BG + (2 << 24)) |
+			0xFF000
+		);
+		NumberOfBytesWritten += 5;
+		// Set texture colour swap tables.
+		//  TODO: these are just being pulled from a register dump, maybe split out the bitfields at some point?
+		CppWriteBpReg((BPMEM_TEV_KSEL + (2 << 24)) |
+			0x1806C
+		);
+		NumberOfBytesWritten += 5;
+		CppWriteBpReg((BPMEM_TEV_KSEL + (3 << 24)) |
+			0x1806E
+		);
+		NumberOfBytesWritten += 5;
+		CppWriteBpReg((BPMEM_TEV_KSEL + (4 << 24)) |
+			0x1806F
+		);
+		NumberOfBytesWritten += 5;
+		CppWriteBpReg((BPMEM_TEV_KSEL + (5 << 24)) |
+			0x1806E
+		);
+		NumberOfBytesWritten += 5;
+		// Configure texture stages.
+		//  TODO: these are just being pulled from a register dump, maybe split out the bitfields at some point?
+		CppWriteBpReg((BPMEM_TEV_ALPHA_ENV + (0 << 24)) |
+			0x8ffc4
+		);
+		NumberOfBytesWritten += 5;
+		CppWriteBpReg((BPMEM_TEV_COLOR_ENV + (0 << 24)) |
+			0x8f82f
+		);
+		NumberOfBytesWritten += 5;
+		CppWriteBpReg((BPMEM_TEV_COLOR_ENV + (2 << 24)) |
+			0xc8f
+		);
+		NumberOfBytesWritten += 5;
+		CppWriteBpReg((BPMEM_TEV_ALPHA_ENV + (2 << 24)) |
+			0xf050
+		);
+		NumberOfBytesWritten += 5;
+		CppWriteBpReg((BPMEM_TEV_COLOR_ENV + (2 << 24)) |
+			0x80c8f
+		);
+		NumberOfBytesWritten += 5;
+		CppWriteBpReg((BPMEM_TEV_ALPHA_ENV + (2 << 24)) |
+			0x8f050
+		);
+		NumberOfBytesWritten += 5;
+		CppWriteBpReg((BPMEM_TREF + (0 << 24)) |
+			0x3c13c0
+		);
+		NumberOfBytesWritten += 5;
+		CppWriteBpReg((BPMEM_TEV_ALPHA_ENV + (2 << 24)) |
+			0x8f058
+		);
+		NumberOfBytesWritten += 5;
+		CppWriteBpReg((BPMEM_TEV_COLOR_ENV + (2 << 24)) |
+			0x88ff0
+		);
+		NumberOfBytesWritten += 5;
+		CppWriteBpReg((BPMEM_TEV_ALPHA_ENV + (2 << 24)) |
+			0x8ffe8
+		);
+		NumberOfBytesWritten += 5;
+		
+	} else {
+		// Ensure first texture stage is correct for 16/32bpp.
+		//  TODO: these are just being pulled from a register dump, maybe split out the bitfields at some point?
+		CppWriteBpReg((BPMEM_TEV_KSEL + (2 << 24)) |
+			0x18060
+		);
+		NumberOfBytesWritten += 5;
+		CppWriteBpReg((BPMEM_TEV_KSEL + (3 << 24)) |
+			0x1806C
+		);
+		NumberOfBytesWritten += 5;
+		CppWriteBpReg((BPMEM_TEV_KSEL + (4 << 24)) |
+			0x18065
+		);
+		NumberOfBytesWritten += 5;
+		CppWriteBpReg((BPMEM_TEV_KSEL + (5 << 24)) |
+			0x1806D
+		);
+		NumberOfBytesWritten += 5;
+		CppWriteBpReg((BPMEM_TEV_COLOR_ENV + (0 << 24)) |
+			0x8fff8
+		);
+		NumberOfBytesWritten += 5;
+		CppWriteBpReg((BPMEM_TEV_ALPHA_ENV + (0 << 24)) |
+			0x8ffc0
+		);
+		NumberOfBytesWritten += 5;
+		CppWriteBpReg((BPMEM_TREF + (0 << 24)) |
+			0x493c0
+		);
+		NumberOfBytesWritten += 5;
+	}
 	// Set up the texture dma.
 	CppWriteBpReg(
 		BPMEM_TX_SETMODE0 | 
@@ -307,8 +549,7 @@ static void PepCopyBeDoubleBufferToEfb(PDEVICE_EXTENSION Extension) {
 		BPMEM_TX_SETIMAGE0 |
 		((640 - 1) << 0) | // width
 		((480 - 1) << 10) | // height
-		(6 << 20) // format: RGBA8
-		//(4 << 20) // format: RGB565
+		(Format << 20)
 	);
 	NumberOfBytesWritten += 5;
 	CppWriteBpReg(
@@ -317,17 +558,36 @@ static void PepCopyBeDoubleBufferToEfb(PDEVICE_EXTENSION Extension) {
 		(3 << 18)   // even tmem height?
 	);
 	NumberOfBytesWritten += 5;
-	CppWriteBpReg(
-		BPMEM_TX_SETIMAGE2 |
-		0x4000 |    // odd tmem line
-		(3 << 15) | // odd tmem width?
-		(3 << 18)   // odd tmem height?
-	);
+	if (Format >= 9) {
+		CppWriteBpReg(
+			BPMEM_TX_SETIMAGE2 |
+			0x400 |     // odd tmem line
+			(3 << 15) | // odd tmem width?
+			(3 << 18)   // odd tmem height?
+		);
+	} else {
+		CppWriteBpReg(
+			BPMEM_TX_SETIMAGE2 |
+			0x4000 |    // odd tmem line
+			(3 << 15) | // odd tmem width?
+			(3 << 18)   // odd tmem height?
+		);
+	}
 	NumberOfBytesWritten += 5;
 	CppWriteBpReg(BPMEM_TX_SETIMAGE3 |
 		(Extension->DoubleFrameBufferPhys >> 5)
 	);
 	NumberOfBytesWritten += 5;
+	
+	// Enable the colour table for CI8
+	if (Format >= 9) {
+		CppWriteBpReg(BPMEM_TX_SETTLUT |
+			(0x200 << 0) | // TMEM offset : ((0xC0000 - 0x80000) >> 9)
+			(0 << 10)      // Format: IA8
+		);
+		NumberOfBytesWritten += 5;
+	}
+	
 	
 	// Write XF registers
 	// These are actually floats, but as we don't care about custom params (we just blit the whole framebuffer),
@@ -365,6 +625,19 @@ static void PepCopyBeDoubleBufferToEfb(PDEVICE_EXTENSION Extension) {
 	);
 	NumberOfBytesWritten += 5;
 	
+	// Set the gen mode depending on CI8 or not
+	if (Format >= 9) {
+		CppWriteBpReg(BPMEM_GENMODE |
+			(1 << 0) | // 1 texture
+			(1 << 10)  // 2 TEV stages 
+		);
+	} else {
+		CppWriteBpReg(BPMEM_GENMODE |
+			(1 << 0)  // 1 texture, 1 TEV stage
+		);
+	}
+	NumberOfBytesWritten += 5;
+	
 	// And finally draw the texture to efb
 	CppWrite8(0x80); // Draw quads
 	CppWrite16(4); // 4 of them
@@ -389,6 +662,8 @@ static void PepCopyBeDoubleBufferToEfb(PDEVICE_EXTENSION Extension) {
 	CppWrite32(0); // from 0
 	CppWrite32(0x3f800000); // to 1.0
 	NumberOfBytesWritten += 3 + (4 * 10);
+	
+	
 	
 	for (ULONG i = NumberOfBytesWritten; (i & 31) != 0; i++) {
 		CppWrite8(0);
@@ -609,8 +884,10 @@ VP_STATUS ViFindAdapter(PVOID HwDeviceExtension, PVOID HwContext, PWSTR Argument
 	// We'll use only 640x480x32 for this.
 	Extension->DoubleFrameBuffer = NULL;
 	Extension->MappedFrameBuffer = NULL;
+	Extension->BitmapBuffer = NULL;
 	Extension->DoubleFrameBufferPhys = 0;
 	Extension->FrameBufferOffset = 0;
+	Extension->VideoModeIndex = 0;
 	if (SetupddLoaded || !HasWin32k)
 	{
 		PHYSICAL_ADDRESS HighestAcceptable;
@@ -647,69 +924,134 @@ VP_STATUS ViFindAdapter(PVOID HwDeviceExtension, PVOID HwContext, PWSTR Argument
 			// Also initialise the timer and DPC.
 			KeInitializeDpc(&Extension->TimerDpc, FbpTimerCallback, Extension);
 			KeInitializeTimer(&Extension->Timer);
+		} else {
+			// Allocate and map the bank buffer. Must be used uncached here as the physical page will get mapped elsewhere as uncached.
+			// BUGBUG: this will only work correctly on 32bpp for now due to the flipper memory controller issue!
+			Extension->BankBufferAlloc = (PULONG)MmAllocateContiguousMemory(PAGE_SIZE, HighestAcceptable);
+			if (Extension->BankBufferAlloc == NULL) return ERROR_DEV_NOT_EXIST;
+			PHYSICAL_ADDRESS BankBufferPhys = MmGetPhysicalAddress(Extension->BankBufferAlloc);
+			Extension->BankBufferPhys = BankBufferPhys.LowPart;
+			Extension->BankBuffer = MmMapIoSpace( BankBufferPhys, PAGE_SIZE, MmNonCached );
+			RtlZeroMemory(Extension->BankBuffer, PAGE_SIZE);
+			Extension->BankCurrent = 0;
+			
+			if (FbpHasWin32k()) {
+				// Allocate and map the bitmap buffer for GDI to use as a framebuffer.
+				// This is needed so the bank buffer changes can be visible to GDI as well.
+				// A cached mapping is fine for this.
+				Extension->BitmapBuffer = (PULONG)MmAllocateContiguousMemory(DOUBLE_FRAMEBUFFER_LENGTH, HighestAcceptable);
+				if (Extension->BitmapBuffer == NULL) return ERROR_DEV_NOT_EXIST;
+				RtlZeroMemory(Extension->BitmapBuffer, DOUBLE_FRAMEBUFFER_LENGTH);
+			}
 		}
 	}
 	
-	// Initialise the video mode.
-	s_VideoMode.Length = sizeof(s_VideoMode);
-	s_VideoMode.ModeIndex = 0;
+	// Initialise the video modes.
+	s_VideoModes[0].Length = sizeof(s_VideoModes[0]);
+	s_VideoModes[0].ModeIndex = 0;
 #if 0
 	if (SetupddLoaded) {
-		s_VideoMode.VisScreenWidth = DOUBLE_FRAMEBUFFER_WIDTH;
-		s_VideoMode.VisScreenHeight = DOUBLE_FRAMEBUFFER_HEIGHT;
-		s_VideoMode.ScreenStride = DOUBLE_FRAMEBUFFER_STRIDE;
+		s_VideoModes[0].VisScreenWidth = DOUBLE_FRAMEBUFFER_WIDTH;
+		s_VideoModes[0].VisScreenHeight = DOUBLE_FRAMEBUFFER_HEIGHT;
+		s_VideoModes[0].ScreenStride = DOUBLE_FRAMEBUFFER_STRIDE;
 	} else {	
 		// EFB is 640x480 or 640x528, we will always render 640x480.
-		s_VideoMode.VisScreenWidth = 640;
-		s_VideoMode.VisScreenHeight = 480;
-		s_VideoMode.ScreenStride = EFB_STRIDE;
+		s_VideoModes[0].VisScreenWidth = 640;
+		s_VideoModes[0].VisScreenHeight = 480;
+		s_VideoModes[0].ScreenStride = EFB_STRIDE;
 	}
 #endif
 	if (!SetupddLoaded && HasWin32k) {
 		// EFB is 640x480 or 640x528, we will always render 640x480.
-		s_VideoMode.VisScreenWidth = 640;
-		s_VideoMode.VisScreenHeight = 480;
-		s_VideoMode.ScreenStride = EFB_STRIDE;
+		s_VideoModes[0].VisScreenWidth = 640;
+		s_VideoModes[0].VisScreenHeight = 480;
+		s_VideoModes[0].ScreenStride = EFB_STRIDE;
 	} else {
-		s_VideoMode.VisScreenWidth = DOUBLE_FRAMEBUFFER_WIDTH;
-		s_VideoMode.VisScreenHeight = DOUBLE_FRAMEBUFFER_HEIGHT;
-		s_VideoMode.ScreenStride = DOUBLE_FRAMEBUFFER_STRIDE;
+		s_VideoModes[0].VisScreenWidth = DOUBLE_FRAMEBUFFER_WIDTH;
+		s_VideoModes[0].VisScreenHeight = DOUBLE_FRAMEBUFFER_HEIGHT;
+		s_VideoModes[0].ScreenStride = DOUBLE_FRAMEBUFFER_STRIDE;
 	}
-	s_VideoMode.NumberOfPlanes = 1;
-	s_VideoMode.BitsPerPlane = 32;
-	s_VideoMode.Frequency = 60;
+	s_VideoModes[0].NumberOfPlanes = 1;
+	s_VideoModes[0].BitsPerPlane = 32;
+	s_VideoModes[0].Frequency = 60;
 	// todo: Is this correct?
-	s_VideoMode.XMillimeter = 320;
-	s_VideoMode.YMillimeter = 240;
-	s_VideoMode.NumberRedBits = 8;
-	s_VideoMode.NumberGreenBits = 8;
-	s_VideoMode.NumberBlueBits = 8;
+	s_VideoModes[0].XMillimeter = 320;
+	s_VideoModes[0].YMillimeter = 240;
+	s_VideoModes[0].NumberRedBits = 8;
+	s_VideoModes[0].NumberGreenBits = 8;
+	s_VideoModes[0].NumberBlueBits = 8;
 	// watch out for endianness!
-	s_VideoMode.BlueMask =  0x000000ff;
-	s_VideoMode.GreenMask = 0x0000ff00;
-	s_VideoMode.RedMask =   0x00ff0000;
-	s_VideoMode.AttributeFlags = VIDEO_MODE_GRAPHICS;
+	s_VideoModes[0].BlueMask =  0x000000ff;
+	s_VideoModes[0].GreenMask = 0x0000ff00;
+	s_VideoModes[0].RedMask =   0x00ff0000;
+	s_VideoModes[0].AttributeFlags = VIDEO_MODE_GRAPHICS;
 #ifdef SETUPDD_TEST
 	if (SetupddLoaded) {
-		s_VideoMode.BitsPerPlane = 16;
-		s_VideoMode.RedMask = 0x001f;
-		s_VideoMode.GreenMask = 0x07e0;
-		s_VideoMode.BlueMask = 0xf800;
+		s_VideoModes[0].BitsPerPlane = 16;
+		s_VideoModes[0].RedMask = 0x001f;
+		s_VideoModes[0].GreenMask = 0x07e0;
+		s_VideoModes[0].BlueMask = 0xf800;
 	}
 #endif
 #if 0
 	if (!SetupddLoaded) {
-		s_VideoMode.BitsPerPlane = 16;
-		s_VideoMode.RedMask = 0x001f;
-		s_VideoMode.GreenMask = 0x07e0;
-		s_VideoMode.BlueMask = 0xf800;
+		s_VideoModes[0].BitsPerPlane = 16;
+		s_VideoModes[0].RedMask = 0x001f;
+		s_VideoModes[0].GreenMask = 0x07e0;
+		s_VideoModes[0].BlueMask = 0xf800;
 	}
 #endif
+	if (!SetupddLoaded) {
+		// Other modes.
+		for (ULONG i = 1; i < VIDEO_MODE_COUNT; i++) {
+			RtlCopyMemory(&s_VideoModes[i], &s_VideoModes[0], sizeof(s_VideoModes[0]));
+			s_VideoModes[i].ModeIndex = i;
+			ULONG Depth = i % COLOUR_DEPTH_COUNT;
+			ULONG Res = i / RESOLUTION_COUNT;
+			if (Res == RESOLUTION_240P) {
+				s_VideoModes[i].VisScreenWidth = 320;
+				s_VideoModes[i].VisScreenHeight = 240;
+				s_VideoModes[i].ScreenStride = 320 * sizeof(ULONG);
+			}
+			
+			if (Depth == COLOUR_DEPTH_16) {
+				s_VideoModes[i].BitsPerPlane = 16;
+				s_VideoModes[i].NumberRedBits = 5;
+				s_VideoModes[i].NumberGreenBits = 6;
+				s_VideoModes[i].NumberBlueBits = 5;
+				s_VideoModes[i].BlueMask = 0x001f;
+				s_VideoModes[i].GreenMask = 0x07e0;
+				s_VideoModes[i].RedMask = 0xf800;
+			} else if (Depth == COLOUR_DEPTH_8) {
+				s_VideoModes[i].BitsPerPlane = 8;
+				s_VideoModes[i].AttributeFlags |= VIDEO_MODE_PALETTE_DRIVEN | VIDEO_MODE_MANAGED_PALETTE;
+			}
+		}
+		
+	}
 	
 	// We are done. Only one device exists.
 	*Again = FALSE;
 	
 	return NO_ERROR;
+}
+
+static USHORT Convert888ToGR(ULONG value) {
+	USHORT ret = 0;
+	value = LoadToRegister32(value);
+	USHORT r = (value >> 0) & 0xFF;
+	USHORT g = (value >> 8) & 0xFF;
+	//USHORT b = (value >> 16) & 0xFF;
+	ret = (g << 8);
+	ret |= r;
+	return ret;
+}
+
+static USHORT Convert888ToB(ULONG value) {
+	USHORT ret = 0;
+	value = LoadToRegister32(value);
+	USHORT b = (value >> 16) & 0xFF;
+	return b;
 }
 
 BOOLEAN ViInitialise(PVOID HwDeviceExtension) {
@@ -741,7 +1083,7 @@ BOOLEAN ViInitialise(PVOID HwDeviceExtension) {
 	if (!Extension->SetupddLoaded && Extension->DoubleFrameBuffer != NULL) {
 		ULONG Count = DOUBLE_FRAMEBUFFER_LENGTH / 4;
 		volatile ULONG * pTex = (volatile ULONG*) Extension->DoubleFrameBuffer;
-		register ULONG Black = 0;
+		register ULONG Black = 0; // for CI8: under GDI, colour index 0 is always black
 		while (Count--) {
 			NativeWrite32(pTex, Black);
 			pTex++;
@@ -767,6 +1109,119 @@ BOOLEAN ViInitialise(PVOID HwDeviceExtension) {
 	return TRUE;
 }
 
+static void ViFlip8(PUCHAR Tex, PUCHAR Bank, ULONG Width, ULONG Line, BOOLEAN ToTex) {
+	PUCHAR Source = Bank;
+	ULONG cyIdx = Line;
+	{
+		PUCHAR thisSource = Source;
+		ULONG TexOffsetY = CalculateTexYOffset8(cyIdx, Width);
+		ULONG cxIdx = 0;
+		ULONG cxTemp = Width;
+		while (cxTemp) {
+			// Guaranteed to be aligned, so we can do this:
+			ULONG TexOffset = CalculateTexOffsetWithYOffset8(cxIdx, TexOffsetY);
+			if (ToTex) NativeWriteBase32( Tex, TexOffset, __builtin_bswap32(*(PULONG)thisSource) );
+			else *(PULONG)thisSource = __builtin_bswap32(NativeReadBase32( Tex, TexOffset ));
+			cxTemp -= 4;
+			cxIdx += 4;
+			thisSource += 4;
+		}
+	}
+}
+
+static ULONG Rol32(ULONG Value, ULONG Count) {
+	const ULONG mask = (8 * sizeof(Value) - 1);
+	Count &= mask;
+	return (Value << Count) | (Value >> ( (-Count) & mask));
+}
+
+static void ViFlip16(PUCHAR Tex, PUCHAR Bank, ULONG Width, ULONG Line, BOOLEAN ToTex) {
+	PUCHAR Source = Bank;
+	ULONG cyIdx = Line;
+	{
+		PUCHAR thisSource = Source;
+		ULONG TexOffsetY = CalculateTexYOffset16(cyIdx, Width);
+		ULONG cxIdx = 0;
+		ULONG cxTemp = Width;
+		while (cxTemp) {
+			// Guaranteed to be aligned, so we can do this:
+			ULONG TexOffset = CalculateTexOffsetWithYOffset16(cxIdx, TexOffsetY);
+			
+			if (ToTex) NativeWriteBase32( Tex, TexOffset, Rol32(*(PULONG)thisSource, 16) );
+			else *(PULONG)thisSource = Rol32(NativeReadBase32(Tex, TexOffset), 16);
+			cxTemp -= 2;
+			cxIdx += 2;
+			thisSource += 4;
+		}
+	}
+}
+
+static void ViFlip32(PUCHAR Tex, PUCHAR Bank, ULONG Width, ULONG Line, BOOLEAN ToTex) {
+	PUCHAR Source = Bank;
+	ULONG cyIdx = Line;
+	{
+		PUCHAR thisSource = Source;
+		ULONG TexOffsetY = CalculateTexYOffset32(cyIdx, Width);
+		ULONG cxIdx = 0;
+		ULONG cxTemp = Width;
+		while (cxTemp) {
+			// Guaranteed to be aligned, so we can do this:
+			ULONG TexOffset = CalculateTexOffsetWithYOffset32(cxIdx, TexOffsetY);
+			if (ToTex) {
+				ULONG rgb0 = *(PULONG)thisSource;
+				thisSource += 4;
+				ULONG rgb1 = *(PULONG)thisSource;
+				thisSource += 4;
+				ULONG value = 0xFF00FF00 | (rgb1 >> 16) | (rgb0 & 0xFF0000);
+				ULONG value2 = ((rgb0 & 0xFFFF) << 16) | (rgb1 & 0xFFFF);
+				NativeWriteBase32( Tex, TexOffset, value );
+				NativeWriteBase32( Tex, TexOffset + 0x20, value2 );
+			} else {
+				ULONG tex0 = NativeReadBase32( Tex, TexOffset );
+				ULONG tex1 = NativeReadBase32( Tex, TexOffset + 0x20 );
+				ULONG rgb0 = (tex1 >> 16) | ((tex0 >> 16) & 0xFF);
+				ULONG rgb1 = (tex1 & 0xFFFF) | (tex0 & 0xFF);
+				*(PULONG)thisSource = rgb0;
+				thisSource += 4;
+				*(PULONG)thisSource = rgb1;
+				thisSource += 4;
+			}
+			cxTemp -= 2;
+			cxIdx += 2;
+		}
+	}
+}
+
+void ViBankSwitch(ULONG ReadBank, ULONG WriteBank, PDEVICE_EXTENSION Extension) {
+	// Called on bank switch.
+	// WriteBank is the new bank to switch to.
+	ULONG CurrentLine = Extension->BankCurrent;
+	ULONG ModeIndex = Extension->VideoModeIndex;
+	// For an invalid mode default to 640x480x32
+	if (ModeIndex >= VIDEO_MODE_COUNT) ModeIndex = VIDEO_MODE_480P32;
+	ULONG Width = s_VideoModes[ModeIndex].VisScreenWidth;
+	switch (ModeIndex % COLOUR_DEPTH_COUNT) {
+		case COLOUR_DEPTH_32:
+		default:
+			ViFlip32(Extension->DoubleFrameBuffer, Extension->BankBuffer, Width, CurrentLine, TRUE);
+			if (Extension->BitmapBuffer != NULL) RtlCopyMemory( (PVOID)((ULONG)Extension->BitmapBuffer + (CurrentLine * (Width * 4))), Extension->BankBuffer, Width * 4 );
+			ViFlip32(Extension->DoubleFrameBuffer, Extension->BankBuffer, Width, WriteBank, FALSE);
+			break;
+		case COLOUR_DEPTH_16:
+			ViFlip16(Extension->DoubleFrameBuffer, Extension->BankBuffer, Width, CurrentLine, TRUE);
+			if (Extension->BitmapBuffer != NULL) RtlCopyMemory( (PVOID)((ULONG)Extension->BitmapBuffer + (CurrentLine * (Width * 2))), Extension->BankBuffer, Width * 2 );
+			ViFlip16(Extension->DoubleFrameBuffer, Extension->BankBuffer, Width, WriteBank, FALSE);
+			break;
+		case COLOUR_DEPTH_8:
+			ViFlip8(Extension->DoubleFrameBuffer, Extension->BankBuffer, Width, CurrentLine, TRUE);
+			if (Extension->BitmapBuffer != NULL) RtlCopyMemory( (PVOID)((ULONG)Extension->BitmapBuffer + (CurrentLine * (Width * 1))), Extension->BankBuffer, Width * 1 );
+			ViFlip8(Extension->DoubleFrameBuffer, Extension->BankBuffer, Width, WriteBank, FALSE);
+			break;
+	}
+	
+	Extension->BankCurrent = WriteBank;
+}
+
 VP_STATUS ViStartIoImpl(PDEVICE_EXTENSION Extension, PVIDEO_REQUEST_PACKET RequestPacket) {
 	switch (RequestPacket->IoControlCode) {
 		case IOCTL_VIDEO_SHARE_VIDEO_MEMORY:
@@ -781,8 +1236,9 @@ VP_STATUS ViStartIoImpl(PDEVICE_EXTENSION Extension, PVIDEO_REQUEST_PACKET Reque
 			PVIDEO_SHARE_MEMORY ShareMemory = (PVIDEO_SHARE_MEMORY) RequestPacket->InputBuffer;
 			
 			// Ensure what the caller wants is actually inside the framebuffer.
-			ULONG MaximumLength = DOUBLE_FRAMEBUFFER_LENGTH;
+			ULONG MaximumLength;// = DOUBLE_FRAMEBUFFER_LENGTH;
 			if (Extension->DirectEfbWrites && !Extension->SetupddLoaded) MaximumLength = EFB_LENGTH;
+			else MaximumLength = (DOUBLE_FRAMEBUFFER_HEIGHT * PAGE_SIZE);
 			if (ShareMemory->ViewOffset > MaximumLength) return ERROR_INVALID_PARAMETER;
 			if ((ShareMemory->ViewOffset + ShareMemory->ViewSize) > MaximumLength) return ERROR_INVALID_PARAMETER;
 			
@@ -796,9 +1252,16 @@ VP_STATUS ViStartIoImpl(PDEVICE_EXTENSION Extension, PVIDEO_REQUEST_PACKET Reque
 			FrameBufferPhys.QuadPart = 0;
 			FrameBufferPhys.LowPart = Extension->DoubleFrameBufferPhys;
 			if (Extension->DirectEfbWrites && !Extension->SetupddLoaded) FrameBufferPhys.LowPart = EFB_PHYS_ADDR;
+			else if (!Extension->SetupddLoaded) FrameBufferPhys.LowPart = Extension->BankBufferPhys;
 			ULONG InIoSpace = FALSE;
 			
-			VP_STATUS Status = VideoPortMapMemory(Extension, FrameBufferPhys, &ViewSize, &InIoSpace, &VirtualAddress);
+			VP_STATUS Status;
+			if (Extension->SetupddLoaded || Extension->DirectEfbWrites) {
+				Status = VideoPortMapMemory(Extension, FrameBufferPhys, &ViewSize, &InIoSpace, &VirtualAddress);
+			} else {
+				Status = VideoPortMapBankedMemory(Extension, FrameBufferPhys, &ViewSize, &InIoSpace, &VirtualAddress, PAGE_SIZE, FALSE, ViBankSwitch, Extension);
+			}
+			//VP_STATUS Status = VideoPortMapMemory(Extension, FrameBufferPhys, &ViewSize, &InIoSpace, &VirtualAddress);
 			
 			PVIDEO_SHARE_MEMORY_INFORMATION Information = (PVIDEO_SHARE_MEMORY_INFORMATION) RequestPacket->OutputBuffer;
 			
@@ -838,6 +1301,7 @@ VP_STATUS ViStartIoImpl(PDEVICE_EXTENSION Extension, PVIDEO_REQUEST_PACKET Reque
 			FrameBufferPhys.QuadPart = 0;
 			FrameBufferPhys.LowPart = Extension->DoubleFrameBufferPhys;
 			if (Extension->DirectEfbWrites && !Extension->SetupddLoaded) FrameBufferPhys.LowPart = EFB_PHYS_ADDR;
+			
 			VP_STATUS Status = VideoPortMapMemory(Extension, FrameBufferPhys, &MemInfo->VideoRamLength, &InIoSpace, &MemInfo->VideoRamBase);
 			MemInfo->FrameBufferBase = MemInfo->VideoRamBase;
 			MemInfo->FrameBufferLength = MemInfo->VideoRamLength;
@@ -854,13 +1318,34 @@ VP_STATUS ViStartIoImpl(PDEVICE_EXTENSION Extension, PVIDEO_REQUEST_PACKET Reque
 			break;
 		case IOCTL_VIDEO_QUERY_CURRENT_MODE:
 			// Gets the current video mode.
-		case IOCTL_VIDEO_QUERY_AVAIL_MODES:
-			// Returns information about available video modes (array of VIDEO_MODE_INFORMATION), of which there is exactly one.
-			// Thus for Flipper VI, implementation is same as QUERY_CURRENT_MODE.
 		{
 			if (RequestPacket->OutputBufferLength < sizeof(VIDEO_MODE_INFORMATION)) return ERROR_INSUFFICIENT_BUFFER;
 			RequestPacket->StatusBlock->Information = sizeof(VIDEO_MODE_INFORMATION);
-			RtlCopyMemory(RequestPacket->OutputBuffer, &s_VideoMode, sizeof(s_VideoMode));
+			RtlCopyMemory(RequestPacket->OutputBuffer, &s_VideoModes[Extension->VideoModeIndex], sizeof(s_VideoModes[0]));
+#if 0
+			if (!Extension->SetupddLoaded) {
+				PVIDEO_MODE_INFORMATION OutputInfo = (PVIDEO_MODE_INFORMATION)RequestPacket->OutputBuffer;
+				OutputInfo->ScreenStride = PAGE_SIZE;
+			}
+#endif
+			return NO_ERROR;
+		}
+		case IOCTL_VIDEO_QUERY_AVAIL_MODES:
+			// Returns information about available video modes (array of VIDEO_MODE_INFORMATION).
+		{
+			ULONG ModeCount = VIDEO_MODE_COUNT;
+			if (Extension->SetupddLoaded) ModeCount = 1;
+			if (RequestPacket->OutputBufferLength < (sizeof(VIDEO_MODE_INFORMATION) * ModeCount)) return ERROR_INSUFFICIENT_BUFFER;
+			RequestPacket->StatusBlock->Information = sizeof(VIDEO_MODE_INFORMATION) * ModeCount;
+			RtlCopyMemory(RequestPacket->OutputBuffer, s_VideoModes, sizeof(VIDEO_MODE_INFORMATION) * ModeCount);
+#if 0
+			if (!Extension->SetupddLoaded) {
+				PVIDEO_MODE_INFORMATION OutputInfo = (PVIDEO_MODE_INFORMATION)RequestPacket->OutputBuffer;
+				for (ULONG i = 0; i < ModeCount; i++) {
+					OutputInfo[i].ScreenStride = PAGE_SIZE;
+				}
+			}
+#endif
 			return NO_ERROR;
 		}
 		case IOCTL_VIDEO_QUERY_NUM_AVAIL_MODES:
@@ -870,7 +1355,7 @@ VP_STATUS ViStartIoImpl(PDEVICE_EXTENSION Extension, PVIDEO_REQUEST_PACKET Reque
 			
 			RequestPacket->StatusBlock->Information = sizeof(VIDEO_NUM_MODES);
 			PVIDEO_NUM_MODES NumModes = (PVIDEO_NUM_MODES)RequestPacket->OutputBuffer;
-			NumModes->NumModes = 1;
+			NumModes->NumModes = Extension->SetupddLoaded ? 1 : VIDEO_MODE_COUNT;
 			NumModes->ModeInformationLength = sizeof(VIDEO_MODE_INFORMATION);
 			return NO_ERROR;
 		}
@@ -878,13 +1363,84 @@ VP_STATUS ViStartIoImpl(PDEVICE_EXTENSION Extension, PVIDEO_REQUEST_PACKET Reque
 		{
 			if (RequestPacket->InputBufferLength < sizeof(VIDEO_MODE)) return ERROR_INSUFFICIENT_BUFFER;
 			PVIDEO_MODE Mode = (PVIDEO_MODE)RequestPacket->InputBuffer;
-			if (Mode->RequestedMode >= 1) return ERROR_INVALID_PARAMETER;
-			// Only a single video mode available, so, no operation.
+			ULONG ModeCount = VIDEO_MODE_COUNT;
+			if (Extension->SetupddLoaded) ModeCount = 1;
+			if (Mode->RequestedMode >= ModeCount) return ERROR_INVALID_PARAMETER;
+			if (Extension->VideoModeIndex == Mode->RequestedMode) return NO_ERROR;
+			// Disable VI interrupt zero and one
+			VI_INTERRUPT_DISABLE(0);
+			VI_INTERRUPT_DISABLE(1);
+			Extension->VideoModeIndex = Mode->RequestedMode;
+			ViInitialise(Extension);
 			return NO_ERROR;
 		}
 		case IOCTL_VIDEO_RESET_DEVICE:
 		{
-			// Reset device. No operation as we just have a framebuffer
+			// Reset device.
+			return NO_ERROR;
+		}
+		case IOCTL_VIDEO_SET_COLOR_REGISTERS:
+		{
+			// Set the colour palette.
+			ULONG Depth = Extension->VideoModeIndex % COLOUR_DEPTH_COUNT;
+			if (Depth != COLOUR_DEPTH_8) return ERROR_INVALID_FUNCTION;
+			if (RequestPacket->InputBufferLength < __builtin_offsetof(VIDEO_CLUT, LookupTable)) return ERROR_INSUFFICIENT_BUFFER;
+			PVIDEO_CLUT Clut = (PVIDEO_CLUT)RequestPacket->InputBuffer;
+			if (RequestPacket->InputBufferLength < __builtin_offsetof(VIDEO_CLUT, LookupTable) + (sizeof(ULONG) * Clut->NumEntries)) return ERROR_INSUFFICIENT_BUFFER;
+			ULONG LastEntry = Clut->FirstEntry + Clut->NumEntries;
+			if (LastEntry > 256) return ERROR_INVALID_PARAMETER;
+			PULONG ColourTable = (PULONG)((ULONG)Extension->DoubleFrameBuffer + COLOUR_TABLE_OFFSET);
+			ULONG FirstEntry = Clut->FirstEntry;
+			if ((Clut->FirstEntry & 1) != 0) {
+				ULONG value = NativeReadBase32(ColourTable, (Clut->FirstEntry - 1) * 2);
+				ULONG value2 = NativeReadBase32(ColourTable, ((Clut->FirstEntry - 1) * 2) + 0x200);
+				value &= 0xFFFF0000;
+				value2 &= 0xFFFF0000;
+				value |= (ULONG) Convert888ToGR(Clut->LookupTable[Clut->FirstEntry].RgbLong);
+				value2 |= (ULONG) Convert888ToB(Clut->LookupTable[Clut->FirstEntry].RgbLong);
+				NativeWriteBase32(ColourTable, (Clut->FirstEntry - 1) * 2, value);
+				NativeWriteBase32(ColourTable, ((Clut->FirstEntry - 1) * 2) + 0x200, value2);
+				FirstEntry++;
+			}
+			for (ULONG i = FirstEntry; i < (LastEntry & ~1); i += 2) {
+				ULONG value = (ULONG)Convert888ToGR(Clut->LookupTable[i].RgbLong);
+				ULONG value2 = (ULONG)Convert888ToB(Clut->LookupTable[i].RgbLong);
+				value <<= 16;
+				value2 <<= 16;
+				value |= (ULONG) Convert888ToGR(Clut->LookupTable[i + 1].RgbLong);
+				value2 |= (ULONG) Convert888ToB(Clut->LookupTable[i + 1].RgbLong);
+				NativeWriteBase32(ColourTable, i * 2, value);
+				NativeWriteBase32(ColourTable, (i * 2) + 0x200, value2);
+			}
+			if ((LastEntry & 1) != 0) {
+				ULONG value = NativeReadBase32(ColourTable, (LastEntry - 1) * 2);
+				ULONG value2 = NativeReadBase32(ColourTable, ((LastEntry - 1) * 2) + 0x200);
+				value &= 0xFFFF0000;
+				value2 &= 0xFFFF0000;
+				value |= (ULONG) Convert888ToGR(Clut->LookupTable[LastEntry].RgbLong);
+				value2 |= (ULONG) Convert888ToB(Clut->LookupTable[LastEntry].RgbLong);
+				NativeWriteBase32(ColourTable, (LastEntry - 1) * 2, value);
+				NativeWriteBase32(ColourTable, ((LastEntry - 1) * 2) + 0x200, value2);
+			}
+			return NO_ERROR;
+		}
+		case IOCTL_VIDEO_GET_BITMAP_BUFFER:
+		{
+			// Caller asked for the bitmap buffer we allocated.
+			if (Extension->BitmapBuffer == NULL) return ERROR_INVALID_FUNCTION;
+			if (RequestPacket->OutputBufferLength < sizeof(VIDEO_MEMORY_INFORMATION)) return ERROR_INSUFFICIENT_BUFFER;
+			if (RequestPacket->InputBufferLength < sizeof(VIDEO_MEMORY)) return ERROR_INSUFFICIENT_BUFFER;
+			
+			RequestPacket->StatusBlock->Information = sizeof(VIDEO_MEMORY_INFORMATION);
+			
+			PVIDEO_MEMORY_INFORMATION MemInfo = (PVIDEO_MEMORY_INFORMATION) RequestPacket->OutputBuffer;
+			PVIDEO_MEMORY Mem = (PVIDEO_MEMORY) RequestPacket->InputBuffer;
+			
+			MemInfo->VideoRamBase = Mem->RequestedVirtualAddress;
+			ULONG MaximumLength = DOUBLE_FRAMEBUFFER_LENGTH;
+			MemInfo->VideoRamLength = MaximumLength;
+			MemInfo->FrameBufferBase = Extension->BitmapBuffer;
+			MemInfo->FrameBufferLength = MemInfo->VideoRamLength;
 			return NO_ERROR;
 		}
 	}
