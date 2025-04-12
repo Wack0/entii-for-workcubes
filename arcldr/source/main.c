@@ -115,6 +115,14 @@ static const u16 ticket_check[] = {
     0x07DB                // lsls r3, r3, #31; check AHBPROT bit
 };
 
+static inline USHORT read16(ULONG addr)
+{
+	USHORT x;
+	__asm__ __volatile__(
+		"lhz %0,0(%1) ; sync" : "=r"(x) : "b"(addr));
+	return x;
+}
+
 static inline ULONG read32(ULONG addr)
 {
 	ULONG x;
@@ -428,10 +436,34 @@ int main(int argc, char** argv) {
 	ULONG SplashSize = *(PULONG)(0x80000028);
 	ULONG DdrSize = 0;
 	ULONG DdrIpcSize = 0; // from end of DDR
+	ULONG RealDdrSize = 0;
 	#ifdef HW_RVL
 	DdrSize = *(PULONG)(0x80003120) - 0x90000000;
 	DdrIpcSize = DdrSize - (*(PULONG)(0x80003130) - 0x90000000);
-	#endif
+	RealDdrSize = DdrSize;
+	if ((read32(0xCD800064) == 0xFFFFFFFF) ? 1 : 0) {
+		// We have full hardware access.
+		// Disable DDR memory protection.
+		write16(MEM2_PROT, 0);
+		// We now can check various registers.
+		// Devkits have two ranks of DDR.
+		if (read16(0xCD8B4216) == 1) {
+			// This is really 128MB, if this thing is running 64MB IOS then override the size
+			if (RealDdrSize <= 0x4000000) RealDdrSize = 0x8000000;
+		}
+		// On vWii we can modify a single register and get 256MB of DDR
+		if ((read32(0xCD8005A0) >> 16) == 0xCAFE) {
+			write16(0xCD8B421A, 0x3FFF);
+			RealDdrSize = 0x10000000;
+		}
+	}
+	#else
+	// This is a gamecube, it might have double Splash if it's a devkit
+	if (read16(0xCC004028) == 3) {
+		// 48MB configuration
+		if (SplashSize <= 0x1800000) SplashSize = 0x3000000;
+	}
+	#endif	
 	
 	// Get bus and cpu speed
 	ULONG BusSpeed = *(PULONG)(0x800000F8);
@@ -614,7 +646,7 @@ int main(int argc, char** argv) {
 	// We now have free memory at exactly 4MB, we can use this to store our descriptor.
 	PHW_DESCRIPTION Desc = (PHW_DESCRIPTION) Addr;
 	Desc->MemoryLength[0] = SplashSize;
-	Desc->MemoryLength[1] = DdrSize;
+	Desc->MemoryLength[1] = RealDdrSize;
 	Desc->DdrIpcBase = (DdrSize - DdrIpcSize) + 0x10000000;
 	Desc->DdrIpcLength = DdrIpcSize;
 	Desc->DecrementerFrequency = BusSpeed / 4;
