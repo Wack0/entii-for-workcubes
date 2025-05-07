@@ -1179,6 +1179,71 @@ static ARC_STATUS GetImageBase(ULONG DeviceId, PCHAR Dir, PCHAR FileName, PULONG
     return _ESUCCESS;
 }
 
+typedef enum {
+    FILE_NOT_PE,
+    FILE_KERNEL_UNIPROCESSOR,
+    FILE_KERNEL_MULTIPROCESSOR
+} KERNEL_FILE_TYPE;
+
+static ARC_STATUS GetKernelType(ULONG FileId, KERNEL_FILE_TYPE* KernelFileType) {
+    UCHAR HeaderPage[PAGE_SIZE + 0x40];
+    PBYTE LocalPointer = (PVOID)(((ULONG)(&HeaderPage[DCACHE_LINE_SIZE - 1])) & ~(DCACHE_LINE_SIZE - 1));
+
+    *KernelFileType = FILE_NOT_PE;
+
+    PBL_DEVICE_ENTRY_TABLE DeviceEntryTable = (PBL_DEVICE_ENTRY_TABLE)s_BlFileTable[FileId].DeviceEntryTable;
+    orig_DeviceEntryTable[FileId] = DeviceEntryTable;
+    U32LE Count;
+    ARC_STATUS Status = DEVICE_ENTRY_CALL_ORIG(Read, FileId, LocalPointer, PAGE_SIZE, &Count);
+    if (ARC_FAIL(Status)) return Status;
+    LARGE_INTEGER SeekOffset = INT32_TO_LARGE_INTEGER(0);
+    Status = DEVICE_ENTRY_CALL_ORIG(Seek, FileId, &SeekOffset, SeekAbsolute);
+    if (ARC_FAIL(Status)) return Status;
+
+    // for initial header size checks, return success.
+    // only return error if the file seems to be a PE. (that is, valid MZ header pointing to PE header)
+    // size check against MZ header only
+    if (Count.v < sizeof(IMAGE_DOS_HEADER)) return _ESUCCESS;
+    PIMAGE_DOS_HEADER Mz = (PIMAGE_DOS_HEADER)LocalPointer;
+    if (Mz->e_magic != IMAGE_DOS_SIGNATURE) return _ESUCCESS;
+    if ((ULONG)Mz->e_lfanew > (PAGE_SIZE - sizeof(IMAGE_NT_HEADERS))) return _ESUCCESS;
+    PIMAGE_NT_HEADERS Pe = (PIMAGE_NT_HEADERS)&LocalPointer[Mz->e_lfanew];
+    PIMAGE_FILE_HEADER FileHeader = &Pe->FileHeader;
+    // size check against MZ + PE file header
+    if (Count.v < (Mz->e_lfanew + sizeof(*Pe))) return _ESUCCESS;
+    if (Pe->Signature != IMAGE_NT_SIGNATURE) return _ESUCCESS;
+    if (FileHeader->Machine != IMAGE_FILE_MACHINE_POWERPC) return _EBADF;
+
+    // Read the entire file.
+    ULONG FileLength = Pe->OptionalHeader.SizeOfHeaders;
+    USHORT NumberOfSections = FileHeader->NumberOfSections;
+    PIMAGE_OPTIONAL_HEADER OptionalHeader = (PIMAGE_OPTIONAL_HEADER)&FileHeader[1];
+    PIMAGE_SECTION_HEADER Sections = (PIMAGE_SECTION_HEADER)((size_t)OptionalHeader + FileHeader->SizeOfOptionalHeader);
+    // size check against entire PE headers.
+    if (Count.v < (Mz->e_lfanew + sizeof(*Pe) + FileHeader->SizeOfOptionalHeader + (NumberOfSections * sizeof(*Sections)))) return _EBADF;
+    for (int i = 0; i < NumberOfSections; i++) {
+        ULONG SizeAfterSection = Sections[i].PointerToRawData + Sections[i].SizeOfRawData;
+        if (SizeAfterSection > FileLength) FileLength = SizeAfterSection;
+    }
+
+    if ((ULONG)ScratchAddress + FileLength > ScratchEnd()) return _E2BIG;
+
+    Status = DEVICE_ENTRY_CALL_ORIG(Read, FileId, ScratchAddress, FileLength, &Count);
+    if (ARC_FAIL(Status)) return Status;
+    Status = DEVICE_ENTRY_CALL_ORIG(Seek, FileId, &SeekOffset, SeekAbsolute);
+    if (ARC_FAIL(Status)) return Status;
+    
+    // Multiprocessor kernel imports hal!HalStartNextProcessor - uniprocessor kernel does not
+    static const char s_MpKrnlPattern[] = "HalStartNextProcessor";
+    if (mem_mem((PBYTE)ScratchAddress, s_MpKrnlPattern, Count.v, sizeof(s_MpKrnlPattern)) == NULL) {
+        *KernelFileType = FILE_KERNEL_UNIPROCESSOR;
+    }
+    else {
+        *KernelFileType = FILE_KERNEL_MULTIPROCESSOR;
+    }
+    return _ESUCCESS;
+}
+
 static ARC_STATUS hook_BlOpen(ULONG DeviceId, PCHAR OpenPath, OPEN_MODE OpenMode, PU32LE FileId) {
     //printf("hook_BlOpen: %s\r\n", OpenPath);
     ARC_STATUS Status;
@@ -1210,24 +1275,28 @@ static ARC_STATUS hook_BlOpen(ULONG DeviceId, PCHAR OpenPath, OPEN_MODE OpenMode
     // File has been opened.
     ULONG Id = FileId->v;
 
-    // HACK: check by filename if we're loading the kernel.
-    // BUGBUG: this will break if anyone passes KERNEL= boot option... in that case, would need to load kernel ourselves to check.
     // osloader and setupldr will always load the kernel as the first PE loaded.
     // check here as we don't want to hook the PE loader at all if the uniprocessor kernel was loaded
     // also specify whether the kernel is currently being loaded so additional patches can be applied.
     if (!s_KernelIsUniProcessor && !s_KernelIsNotUniProcessor) {
-        char Filename[MAXIMUM_FILE_NAME_LENGTH + 1] = { 0 };
-        memcpy(Filename, s_BlFileTable[Id].FileName, s_BlFileTable[Id].FileNameLength);
-        if (!stricmp(Filename, "ntoskrnl.exe")) {
+
+        KERNEL_FILE_TYPE KernelType = FILE_NOT_PE;
+        // If this is a PE, it must be the kernel, see above.
+        Status = GetKernelType(Id, &KernelType);
+        if (ARC_FAIL(Status)) return Status;
+
+        if (KernelType == FILE_KERNEL_UNIPROCESSOR) {
             s_KernelIsUniProcessor = true;
             return Status;
         }
-        else if (!stricmp(Filename, "ntkrnlmp.exe")) {
+        else if (KernelType == FILE_KERNEL_MULTIPROCESSOR) {
             s_KernelIsNotUniProcessor = true;
             s_IsLoadingNtKernel = true;
         }
-        else {
+        else { // KernelType == FILE_NOT_PE
             s_IsLoadingNtKernel = false;
+            // This is not a PE file, so don't bother hooking here.
+            return Status;
         }
     }
     else {
