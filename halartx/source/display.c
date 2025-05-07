@@ -110,7 +110,7 @@ BOOLEAN HalpInitializeDisplay0 (IN PLOADER_PARAMETER_BLOCK LoaderBlock) {
 	HalpDisplayOwnedByHal = TRUE;
 	ViWipeScreen();
 	HalpColumn = 1;
-	HalpRow = 1;
+	HalpRow = 3;
 	
 	return TRUE;
 	
@@ -189,7 +189,7 @@ static void HalpDisplayOwnByHal(void) {
 	//HalpDisplayAbortWait(1000);
 	ViWipeScreen();
 	HalpColumn = 1;
-	HalpRow = 1;
+	HalpRow = 3;
 	
 }
 
