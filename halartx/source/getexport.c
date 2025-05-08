@@ -2,14 +2,8 @@
 #include <windef.h>
 #include <winnt.h>
 
-PVOID PeGetExport(PVOID ImageBase, PCHAR ExportName) {
+PVOID PeGetExportWithDirectory(PVOID ImageBase, PIMAGE_EXPORT_DIRECTORY Export, const char* ExportName) {
 	PVOID Ret = NULL;
-	
-	PIMAGE_DOS_HEADER Mz = (PIMAGE_DOS_HEADER)ImageBase;
-	PIMAGE_NT_HEADERS Pe = (PIMAGE_NT_HEADERS)((ULONG)ImageBase + Mz->e_lfanew);
-	PIMAGE_DATA_DIRECTORY ExportDir = &Pe->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-
-	PIMAGE_EXPORT_DIRECTORY Export = (PIMAGE_EXPORT_DIRECTORY) ((ULONG)ImageBase + ExportDir->VirtualAddress);
 	
 	ULONG Va = (ULONG)Export - (ULONG)ImageBase;
 	
@@ -36,4 +30,14 @@ PVOID PeGetExport(PVOID ImageBase, PCHAR ExportName) {
 	
 	PULONG AddressOfFunctions = (PULONG)((ULONG)ImageBase + (ULONG)Export->AddressOfFunctions);
 	return (PVOID)((ULONG)ImageBase + AddressOfFunctions[Ordinal]);
+}
+
+PVOID PeGetExport(PVOID ImageBase, const char* ExportName) {
+	PIMAGE_DOS_HEADER Mz = (PIMAGE_DOS_HEADER)ImageBase;
+	PIMAGE_NT_HEADERS Pe = (PIMAGE_NT_HEADERS)((ULONG)ImageBase + Mz->e_lfanew);
+	PIMAGE_DATA_DIRECTORY ExportDir = &Pe->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+
+	PIMAGE_EXPORT_DIRECTORY Export = (PIMAGE_EXPORT_DIRECTORY) ((ULONG)ImageBase + ExportDir->VirtualAddress);
+	
+	return PeGetExportWithDirectory(ImageBase, Export, ExportName);
 }
