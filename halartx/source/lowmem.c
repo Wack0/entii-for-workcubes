@@ -6,175 +6,7 @@
 #include <arc.h>
 #include "runtime.h"
 #include "ppcinst.h"
-
-typedef UCHAR BYTE;
-typedef PUCHAR PBYTE;
-
-// Bring in NT types we need:
-// LDR_DATA_TABLE_ENTRY
-typedef struct _LDR_DATA_TABLE_ENTRY {
-    LIST_ENTRY InLoadOrderLinks;
-    LIST_ENTRY InMemoryOrderLinks;
-    LIST_ENTRY InInitializationOrderLinks;
-    PVOID DllBase;
-    PVOID EntryPoint;
-    ULONG SizeOfImage;
-    UNICODE_STRING FullDllName;
-    UNICODE_STRING BaseDllName;
-    ULONG Flags;
-    USHORT LoadCount;
-    USHORT TlsIndex;
-    union {
-        LIST_ENTRY HashLinks;
-        struct {
-            PVOID SectionPointer;
-            ULONG CheckSum;
-        };
-    };
-    ULONG   TimeDateStamp;
-} LDR_DATA_TABLE_ENTRY, *PLDR_DATA_TABLE_ENTRY;
-
-// PE header structures:
-#include "pshpack4.h"                   // 4 byte packing is the default
-
-#define IMAGE_DOS_SIGNATURE                 0x5A4D      // MZ
-#define IMAGE_OS2_SIGNATURE                 0x454E      // NE
-#define IMAGE_OS2_SIGNATURE_LE              0x454C      // LE
-#define IMAGE_VXD_SIGNATURE                 0x454C      // LE
-#define IMAGE_NT_SIGNATURE                  0x00004550  // PE00
-
-#include "pshpack2.h"                   // 16 bit headers are 2 byte packed
-
-typedef struct _IMAGE_DOS_HEADER {      // DOS .EXE header
-    USHORT e_magic;                     // Magic number
-    USHORT e_cblp;                      // Bytes on last page of file
-    USHORT e_cp;                        // Pages in file
-    USHORT e_crlc;                      // Relocations
-    USHORT e_cparhdr;                   // Size of header in paragraphs
-    USHORT e_minalloc;                  // Minimum extra paragraphs needed
-    USHORT e_maxalloc;                  // Maximum extra paragraphs needed
-    USHORT e_ss;                        // Initial (relative) SS value
-    USHORT e_sp;                        // Initial SP value
-    USHORT e_csum;                      // Checksum
-    USHORT e_ip;                        // Initial IP value
-    USHORT e_cs;                        // Initial (relative) CS value
-    USHORT e_lfarlc;                    // File address of relocation table
-    USHORT e_ovno;                      // Overlay number
-    USHORT e_res[4];                    // Reserved words
-    USHORT e_oemid;                     // OEM identifier (for e_oeminfo)
-    USHORT e_oeminfo;                   // OEM information; e_oemid specific
-    USHORT e_res2[10];                  // Reserved words
-    LONG   e_lfanew;                    // File address of new exe header
-  } IMAGE_DOS_HEADER, *PIMAGE_DOS_HEADER;
-
-#include "poppack.h"                    // Back to 4 byte packing
-
-//
-// File header format.
-//
-
-typedef struct _IMAGE_FILE_HEADER {
-    USHORT  Machine;
-    USHORT  NumberOfSections;
-    ULONG   TimeDateStamp;
-    ULONG   PointerToSymbolTable;
-    ULONG   NumberOfSymbols;
-    USHORT  SizeOfOptionalHeader;
-    USHORT  Characteristics;
-} IMAGE_FILE_HEADER, *PIMAGE_FILE_HEADER;
-
-//
-// Directory format.
-//
-
-typedef struct _IMAGE_DATA_DIRECTORY {
-    ULONG   VirtualAddress;
-    ULONG   Size;
-} IMAGE_DATA_DIRECTORY, *PIMAGE_DATA_DIRECTORY;
-
-#define IMAGE_NUMBEROF_DIRECTORY_ENTRIES    16
-
-//
-// Optional header format.
-//
-
-typedef struct _IMAGE_OPTIONAL_HEADER {
-    //
-    // Standard fields.
-    //
-
-    USHORT  Magic;
-    UCHAR   MajorLinkerVersion;
-    UCHAR   MinorLinkerVersion;
-    ULONG   SizeOfCode;
-    ULONG   SizeOfInitializedData;
-    ULONG   SizeOfUninitializedData;
-    ULONG   AddressOfEntryPoint;
-    ULONG   BaseOfCode;
-    ULONG   BaseOfData;
-
-    //
-    // NT additional fields.
-    //
-
-    ULONG   ImageBase;
-    ULONG   SectionAlignment;
-    ULONG   FileAlignment;
-    USHORT  MajorOperatingSystemVersion;
-    USHORT  MinorOperatingSystemVersion;
-    USHORT  MajorImageVersion;
-    USHORT  MinorImageVersion;
-    USHORT  MajorSubsystemVersion;
-    USHORT  MinorSubsystemVersion;
-    ULONG   Win32VersionValue;
-    ULONG   SizeOfImage;
-    ULONG   SizeOfHeaders;
-    ULONG   CheckSum;
-    USHORT  Subsystem;
-    USHORT  DllCharacteristics;
-    ULONG   SizeOfStackReserve;
-    ULONG   SizeOfStackCommit;
-    ULONG   SizeOfHeapReserve;
-    ULONG   SizeOfHeapCommit;
-    ULONG   LoaderFlags;
-    ULONG   NumberOfRvaAndSizes;
-    IMAGE_DATA_DIRECTORY DataDirectory[IMAGE_NUMBEROF_DIRECTORY_ENTRIES];
-} IMAGE_OPTIONAL_HEADER, *PIMAGE_OPTIONAL_HEADER;
-
-typedef struct _IMAGE_NT_HEADERS {
-    ULONG Signature;
-    IMAGE_FILE_HEADER FileHeader;
-    IMAGE_OPTIONAL_HEADER OptionalHeader;
-} IMAGE_NT_HEADERS, *PIMAGE_NT_HEADERS;
-
-//
-// Section header format.
-//
-
-#define IMAGE_SIZEOF_SHORT_NAME              8
-
-typedef struct _IMAGE_SECTION_HEADER {
-    UCHAR   Name[IMAGE_SIZEOF_SHORT_NAME];
-    union {
-            ULONG   PhysicalAddress;
-            ULONG   VirtualSize;
-    } Misc;
-    ULONG   VirtualAddress;
-    ULONG   SizeOfRawData;
-    ULONG   PointerToRawData;
-    ULONG   PointerToRelocations;
-    ULONG   PointerToLinenumbers;
-    USHORT  NumberOfRelocations;
-    USHORT  NumberOfLinenumbers;
-    ULONG   Characteristics;
-} IMAGE_SECTION_HEADER, *PIMAGE_SECTION_HEADER;
-
-#include "poppack.h"                        // Return to the default
-
-typedef struct {
-    ULONG Function;
-    ULONG Toc;
-} AIXCALL_FPTR, *PAIXCALL_FPTR;
+#include "peimage.h"
 
 static const char s_Real0StartPattern[] = "PowerPC";
 
@@ -225,6 +57,8 @@ static PBYTE mem_mem(PBYTE startPos, const void* pattern, size_t size, size_t pa
 
     return NULL;
 }
+
+BOOLEAN HalpHookKernelPeLoader(PVOID ImageBase);
 
 // Relocate all code from 0x3010 to 0x2000
 // 0x2000 is an unused exception handler (used for PowerPC 601 only)
@@ -342,6 +176,29 @@ BOOLEAN HalpFixLowMem(PLOADER_PARAMETER_BLOCK LoaderBlock) {
 		}
 		// 0x200 could run straight into 0x300 so allow for that
 		if (ExhIndex == 0 && ExhOffset > 0x300) ExhIndex++;
+	}
+	
+	// Is this an Espresso CPU?
+	BOOLEAN IsMultiprocessorEspresso = FALSE;
+	ULONG ProcessorType;
+	asm volatile("mfpvr %0\n" : "=r" (ProcessorType));
+	ProcessorType >>= 16;
+	if (ProcessorType == 0x7001) {
+		// Is this a multiprocessor kernel?
+		// In this case, some instructions were placed in a code cave at real0.
+		// Otherwise, real0+8 is zero.
+		IsMultiprocessorEspresso = (*(PULONG)&Real0[8] != 0);
+	}
+	
+	// If this is multiprocessor espresso, copy 0x500 to 0x1700
+	// 0x1700 is the Espresso-specific IPI handler.
+	// Most older multiprocessor powerpc systems handle IPIs as an external interrupt.
+	// Therefore, we shall do the same.
+	if (IsMultiprocessorEspresso) {
+		memcpy(&Real0[0x1700], &Real0[0x500], 0x100);
+		
+		// Additionally, the kernel's PE loader needs to be hooked.
+		if (!HalpHookKernelPeLoader((PVOID)ImageBase)) return FALSE;
 	}
 	
 	// Copy entire real0.
