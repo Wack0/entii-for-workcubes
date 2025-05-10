@@ -893,11 +893,14 @@ static void EnchantIOP(void) {
 	IOS_Ioctlv(hSha, 0, 1, 2, vec);
 	// wait for context switch to idle thread
 	//sleep(1);
-	while (read32(0xCD800024) != 0xFF00) {}
-	write32(0xCD800024, 0);
+	for (int i = 0; i < 1000000; i++) {
+		if (read32(0xCD800024) == 0xFF00) break;
+		udelay(1);
+	}
 	IOS_Close(hSha);
 	
 	// make sure it worked
+	write32(0xCD800024, 0);
 	if (read32(0xCD800064) != 0xFFFFFFFF) {
 		return;
 	}
