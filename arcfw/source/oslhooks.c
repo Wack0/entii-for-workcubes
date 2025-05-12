@@ -1080,6 +1080,11 @@ static ARC_STATUS fhook_BlSeek(ULONG FileId, PLARGE_INTEGER Offset, SEEK_MODE Se
 static ARC_STATUS fhook_BlRead(ULONG FileId, PVOID Buffer, ULONG Length, PU32LE Count) {
     // Get the patch entry
     PPE_PATCH_ENTRY Patch = &s_PatchTable[FileId];
+#if 0 // debugging on non-espresso
+    ULONG Pvr;
+    __asm__ __volatile__("mfpvr %0" : "=r"(Pvr));
+    Pvr >>= 16;
+#endif
     if (Patch->State == STATE_READING_SECTION_INJECTED) {
         // Memset the entire section to zero for now, data will be written out later
         memset(Buffer, 0, Length);
@@ -1088,6 +1093,9 @@ static ARC_STATUS fhook_BlRead(ULONG FileId, PVOID Buffer, ULONG Length, PU32LE 
         if (Patch->InjectedSectionIsFinal) {
             // this was the last section to load, so perform relocation now!
             Patch->State = STATE_NOP;
+#if 0 // debugging on non-espresso
+            if (Pvr != 0x7001) return _ESUCCESS; // do not actually inject anything fortesting
+#endif
             return PePatch_Relocate(Patch);
         }
         return _ESUCCESS;
@@ -1138,6 +1146,11 @@ static ARC_STATUS fhook_BlRead(ULONG FileId, PVOID Buffer, ULONG Length, PU32LE 
         // Which means there's no need for any length check here, if we got here we're reading the last section.
         // Loaded the final section, perform relocation.
         Patch->State = STATE_NOP;
+#if 0 // debugging on non-espresso
+        if (Pvr != 0x7001) {
+            return _ESUCCESS; // do not actually inject anything
+        }
+#endif
         return PePatch_Relocate(Patch);
 
     default:
@@ -1437,15 +1450,19 @@ static ARC_STATUS hook_BlSetupForNt(PVOID LoaderParameterBlock) {
 void OslHookInit(PVOID BlOpen, PVOID BlFileTable, PVOID BlSetupForNt, PVOID BlReadSignature) {
     (void)BlReadSignature;
 
-    // On Espresso, hook BlOpen and get BlFileTable, to hook the PE loader in osloader/setupldr
+    // On Espresso+Latte, hook BlOpen and get BlFileTable, to hook the PE loader in osloader/setupldr
     // This is so all boot-time loaded PEs get patched:
     // stwcx rS,rA,rB to dcbst rA,rB ; stwcx rS,rA,rB - patching in a branch to a code cave (one created by extra PE section) as required.
     // This is to work around a hardware erratum on multiprocessor Espresso.
     // When NT is booted, the HAL can hook the kernel's PE loader to do the same thing.
+    // Cache coherency is broken on wiimode Espresso, so only a single core can run in that scenario.
     ULONG Pvr;
     __asm__ __volatile__("mfpvr %0" : "=r"(Pvr));
     Pvr >>= 16;
-    if (Pvr == 0x7001) {
+#if 0 // debugging on non-espresso
+    Pvr = 0x7001;
+#endif
+    if (Pvr == 0x7001 && s_RuntimePointers[RUNTIME_SYSTEM_TYPE].v == ARTX_SYSTEM_LATTE) {
         orig_BlOpen = (PBL_OPEN_ROUTINE)BlOpen;
         s_BlFileTable = (PBL_FILE_TABLE)BlFileTable;
         if (ScratchAddress == NULL) ScratchAddress = ArcLoadGetScratchAddress();
