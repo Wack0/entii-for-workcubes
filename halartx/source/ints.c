@@ -10,6 +10,7 @@ enum {
 PPI_INTERRUPT_REGS HalpPiInterruptRegs = NULL;
 IDTUsage        HalpIDTUsage[MAXIMUM_IDTVECTOR];
 KINTERRUPT HalpMachineCheckInterrupt;
+KSPIN_LOCK HalpSystemInterruptLock;
 
 BOOLEAN HalpInEmulator = FALSE;
 
@@ -42,7 +43,7 @@ const ULONG HalpInterruptToIrql[MAX_IRQL_NUM] = {
 	25, // DEBUG
 	19, // HIGHSPEED_PORT (gone from RVL)
 	21, // VEGAS (IOS IPC)
-	17, 17, 17, // WAGON
+	16, 16, 16, // CP_FIFO for each core
 	29, 29, 29, // IPI
 	20, // GPU7
 	21, // LATTE
@@ -141,7 +142,7 @@ void HalDisableSystemInterrupt(ULONG Vector, KIRQL Irql) {
 	// Raise IRQL to the highest level.
 	KIRQL OldIrql;
 	KeRaiseIrql(HIGH_LEVEL, &OldIrql);
-	// MP note: acquire spinlock here
+	KiAcquireSpinLock(&HalpSystemInterruptLock);
 	
 	// Get the actual Flipper/Vegas/Cafe interrupt number
 	Vector -= DEVICE_VECTORS;
@@ -156,7 +157,7 @@ void HalDisableSystemInterrupt(ULONG Vector, KIRQL Irql) {
 		);
 	}
 	
-	// MP note: release spinlock here
+	KiReleaseSpinLock(&HalpSystemInterruptLock);
 	
 	// Lower IRQL
 	KeLowerIrql(OldIrql);
@@ -171,7 +172,7 @@ BOOLEAN HalEnableSystemInterrupt(ULONG Vector, KIRQL Irql, KINTERRUPT_MODE Inter
 	// Raise IRQL to the highest level.
 	KIRQL OldIrql;
 	KeRaiseIrql(HIGH_LEVEL, &OldIrql);
-	// MP note: acquire spinlock here
+	KiAcquireSpinLock(&HalpSystemInterruptLock);
 	
 	// Get the actual Flipper/Vegas/Cafe interrupt number
 	Vector -= DEVICE_VECTORS;
@@ -186,7 +187,7 @@ BOOLEAN HalEnableSystemInterrupt(ULONG Vector, KIRQL Irql, KINTERRUPT_MODE Inter
 		);
 	}
 	
-	// MP note: release spinlock here
+	KiReleaseSpinLock(&HalpSystemInterruptLock);
 	
 	// Lower IRQL
 	KeLowerIrql(OldIrql);
@@ -209,6 +210,19 @@ BOOLEAN HalpHandleExternalInterrupt(
 	IN PVOID ServiceContext,
 	IN PVOID TrapFrame
 ) {
+	// Check if this is really an IPI.
+	if (HalpCpuIsEspresso()) {
+		ULONG CoreId = __mfspr(SPR_PIR);
+		if (CoreId < 3) {
+			if (CoreId != 1) CoreId ^= 2; // flip coreid from 0,1,2 to 2,1,0 as per bit order in SCR
+			ULONG IpiMaskInverted = (__mfspr(SPR_SCR) >> SCR_IPI_BIT);
+			if ((IpiMaskInverted & BIT(CoreId)) != 0) {
+				// this is an IPI
+				KeIpiInterrupt(TrapFrame);
+				return TRUE;
+			}
+		}
+	}
 	// Read the interrupt cause and mask.
 	ULONG Cause = MmioReadBase32(MMIO_OFFSET(HalpPiInterruptRegs, Cause));
 	ULONG Mask = MmioReadBase32(MMIO_OFFSET(HalpPiInterruptRegs, Mask));
@@ -311,21 +325,34 @@ BOOLEAN HalpHandleExternalInterrupt(
 	return ret;
 }
 
+
+// Acknowledge IPI interrupt
+static BOOLEAN HalpAcknowledgeIpi(void) {
+	// Get core ID
+	ULONG PIR = __mfspr(SPR_PIR);
+	if (PIR > 2) return FALSE;
+	
+	// Clear IPI bit for this core
+	ULONG SCR = __mfspr(SPR_SCR);
+	SCR &= ~BIT(SCR_IPI_BIT + 2 - PIR);
+	__mtspr(SPR_SCR, SCR);
+	
+	return TRUE;
+}
+	
+
 // Handle IPI interrupt
-// MPNOTE: finish
-/*
 BOOLEAN HalpHandleIpiInterrupt(
 	IN PKINTERRUPT Interrupt,
 	IN PVOID ServiceContext,
 	IN PVOID TrapFrame
 ) {
-	if (HalAcknowledgeIpi()) {
+	if (HalpAcknowledgeIpi()) {
 		KeIpiInterrupt(TrapFrame);
 		return TRUE;
 	}
 	return FALSE;
 }
-*/
 
 // Map the PI interrupt registers (stage 0)
 static BOOLEAN HalpMapInterruptRegs0(void) {
@@ -433,15 +460,18 @@ BOOLEAN HalpInitialiseInterrupts(void) {
 	// Ensure interrupts are disabled.
 	_disable();
 	
-	// Map the PI interrupt registers for stage 0 init.
-	if (!HalpMapInterruptRegs0()) return FALSE;
-	
-	// Ensure all hardware interrupts are disabled.
-	MmioWriteBase32(MMIO_OFFSET(HalpPiInterruptRegs, Mask), 0);
-	HalpRegisteredInterrupts = 0;
-	
-	// Get the emulator status passed to us from arc firmware
-	HalpInEmulator = RUNTIME_BLOCK[RUNTIME_IN_EMULATOR] != FALSE;
+	// This runs on all CPUs, so only do the global init if this is CPU 0.
+	if (HALPCR->PhysicalProcessor == 0) {
+		// Map the PI interrupt registers for stage 0 init.
+		if (!HalpMapInterruptRegs0()) return FALSE;
+		
+		// Ensure all hardware interrupts are disabled.
+		MmioWriteBase32(MMIO_OFFSET(HalpPiInterruptRegs, Mask), 0);
+		HalpRegisteredInterrupts = 0;
+		
+		// Get the emulator status passed to us from arc firmware
+		HalpInEmulator = RUNTIME_BLOCK[RUNTIME_IN_EMULATOR] != FALSE;
+	}
 	
 	// Reserve the external interrupt vector for the HAL
 	PCR->ReservedVectors |= (1 << EXTERNAL_INTERRUPT_VECTOR);

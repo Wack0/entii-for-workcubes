@@ -484,6 +484,7 @@ static NTSTATUS HalpPxiNewRequestImpl(IOS_OPERATION Op, IOS_HANDLE Handle, NTSTA
 	PIOS_IPC_REQUEST Request = HalpIpcAlloc();
 	if (Request == NULL) return STATUS_INSUFFICIENT_RESOURCES;
 	
+	Request->IpcVirt.Result = 0;
 	Request->IpcVirt.Operation = Op;
 	Request->IpcVirt.Handle = Handle;
 	Request->Status = Status;
@@ -953,7 +954,7 @@ BOOLEAN HalpPxiInit(void) {
 	PHYSICAL_ADDRESS PxiPhysAddr;
 	PxiPhysAddr.HighPart = 0;
 	PxiPhysAddr.LowPart = PXI_REGISTER_BASE;
-	HalpPxiRegisters = (PPXI_REGISTERS) MmMapIoSpace( PxiPhysAddr, sizeof(*HalpPxiRegisters), MmNonCached);
+	HalpPxiRegisters = (PPXI_REGISTERS) MmMapIoSpace( PxiPhysAddr, PAGE_SIZE, MmNonCached);
 	if (HalpPxiRegisters == NULL) {
 		HalDisplayString("PXI: could not map MMIO\n");
 		return FALSE;

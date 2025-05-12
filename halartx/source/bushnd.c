@@ -115,7 +115,9 @@ HalGetInterruptVector(
 		}
 	}
 	
-	*Affinity = 1; // TODO: MP: what interrupts can be taken on other cpus?
+	// TODO: MP: on Cafe interrupts can be taken on other CPUs.
+	// For now only "enhanced vWii" is supported, which uses the old PI and thus can only take interrupts on CPU 0.
+	*Affinity = 1;
 	*Irql = HalpInterruptToIrql[BusInterruptVector];
 	
 	return DEVICE_VECTORS + BusInterruptVector;

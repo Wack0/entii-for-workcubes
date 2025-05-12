@@ -13,6 +13,8 @@ extern PPI_INTERRUPT_REGS HalpPiInterruptRegs;
 static PFRAME_BUFFER s_FbConfig;
 static PVOID s_FrameBuffer = NULL;
 static BOOLEAN s_FbReInitialised = FALSE;
+// Multiprocessor-safety spinlock.
+KSPIN_LOCK HalpDisplayAdapterLock;
 // Console/font stuff.
 BOOLEAN HalpDisplayOwnedByHal;
 ULONG HalpBytesPerRow;
@@ -195,7 +197,7 @@ static void HalpDisplayOwnByHal(void) {
 
 // Prints a string to the VI framebuffer.
 VOID HalDisplayString (PUCHAR String) {
-	// TODO: MP: acquire spinlock for this function.
+	KiAcquireSpinLock(&HalpDisplayAdapterLock);
 	
 	HalpDisplayOwnByHal();
 	
@@ -204,6 +206,7 @@ VOID HalDisplayString (PUCHAR String) {
 		String++;
 	}
 	
+	KiReleaseSpinLock(&HalpDisplayAdapterLock);
 }
 
 // Prints a character to the VI framebuffer.
@@ -250,10 +253,14 @@ HalQueryDisplayParameters (
     OUT PULONG CursorRow
     )
 {
+	KiAcquireSpinLock(&HalpDisplayAdapterLock);
+	
 	*WidthInCharacters = HalpDisplayWidth;
 	*HeightInLines = HalpDisplayText;
 	*CursorColumn = HalpColumn;
 	*CursorRow = HalpRow;
+	
+	KiReleaseSpinLock(&HalpDisplayAdapterLock);
 }
 
 // Sets the current cursor position.
@@ -263,6 +270,8 @@ HalSetDisplayParameters (
     IN ULONG CursorRow
     )
 {
+	KiAcquireSpinLock(&HalpDisplayAdapterLock);
+	
 	if (CursorColumn > HalpDisplayWidth) {
 		CursorColumn = HalpDisplayWidth;
 	}
@@ -271,6 +280,8 @@ HalSetDisplayParameters (
 	}
 	HalpColumn = CursorColumn;
 	HalpRow = CursorRow;
+	
+	KiReleaseSpinLock(&HalpDisplayAdapterLock);
 }
 
 // Outputs a character whose font data is specified.

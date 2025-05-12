@@ -128,6 +128,9 @@ ULONG HalSetTimeIncrement(ULONG DesiredIncrement) {
 BOOLEAN HalpCalibrateStall(void) {
 	PCR->StallScaleFactor = 1;
 	
+	// This runs on all CPUs, so only do the global init if CPU0.
+	if (HALPCR->PhysicalProcessor != 0) return TRUE;
+	
 	HalpPerformanceFrequency = RUNTIME_BLOCK[RUNTIME_DECREMENTER_FREQUENCY];
 	HalpClockCount = (HalpPerformanceFrequency * (MAXIMUM_INCREMENT/10000)) / 1000;
 	HalpFullTickClockCount = HalpClockCount;
