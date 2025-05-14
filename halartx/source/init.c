@@ -194,7 +194,7 @@ HalInitializeProcessor (
 			asm volatile("isync");
 #endif
 			__mtspr(SPR_HID0, 0x11C024);
-			__mtspr(SPR_HID4, 0xB3B00000);
+			__mtspr(SPR_HID4, 0xB1B00000);
 		
 			HID5 |= 0x67FDC000; // This is what Cafe OS sets, with bit 27 unset (this bit specifically hangs the PPC in wiimode when set)
 			__mtspr(SPR_HID5, HID5);
