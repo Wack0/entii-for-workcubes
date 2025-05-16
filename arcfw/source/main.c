@@ -1114,19 +1114,29 @@ void ARC_NORETURN FwMain(PHW_DESCRIPTION Desc) {
 	memcpy(&StackDesc, Desc, sizeof(StackDesc));
 	Desc = &StackDesc;
 
-	// Acknowledge and mask off all interrupts.
-	MmioWriteBase32((PVOID)0x6C000000, 0x3004, 0); // PI_INTMASK = 0
-	MmioWriteBase32((PVOID)0x6C000000, 0x3000, 0xFFFFFFFF); // PI_INTSTATUS = 0xFFFFFFFF
-
 	// Determine system type.
 	ARTX_SYSTEM_TYPE SystemType = ARTX_SYSTEM_FLIPPER;
 	if ((Desc->FpFlags & FPF_IS_VEGAS) != 0) SystemType = ARTX_SYSTEM_VEGAS;
 	if ((Desc->FpFlags & FPF_IS_LATTE) != 0) SystemType = ARTX_SYSTEM_LATTE;
 
+	if (SystemType != ARTX_SYSTEM_LATTE) {
+		// Acknowledge and mask off all interrupts.
+		MmioWriteBase32((PVOID)0x6C000000, 0x3004, 0); // PI_INTMASK = 0
+		MmioWriteBase32((PVOID)0x6C000000, 0x3000, 0xFFFFFFFF); // PI_INTSTATUS = 0xFFFFFFFF
+	}
+
+
 	// Latte uses an RGB framebuffer, not a YUV one.
-	if (SystemType == ARTX_SYSTEM_LATTE) ArcConsoleUseRgb();
+	if (SystemType == ARTX_SYSTEM_LATTE) {
+		ArcConsoleUseRgb();
+		// Set the framebuffers to 64-bit endian swap.
+		MmioWriteBase32((PVOID)0x6C200000, 0x610C, 3);
+		MmioWriteBase32((PVOID)0x6C200000, 0x618C, 3);
+		MmioWriteBase32((PVOID)0x6C200000, 0x690C, 3);
+		MmioWriteBase32((PVOID)0x6C200000, 0x698C, 3);
+	}
 	// Initialise the console. We know where it is. Just convert it from physical address to our BAT mapping.
-	ArcConsoleInit(MEM_PHYSICAL_TO_K1(Desc->FrameBufferBase), 20, 20, Desc->FrameBufferWidth, Desc->FrameBufferHeight, Desc->FrameBufferStride);
+	ArcConsoleInit(MEM_PHYSICAL_TO_K1(Desc->FrameBufferBase), SystemType == ARTX_SYSTEM_LATTE ? 60 : 20, SystemType == ARTX_SYSTEM_LATTE ? 60 : 20, Desc->FrameBufferWidth, Desc->FrameBufferHeight, Desc->FrameBufferStride);
 	
 	// Initialise the exception handlers.
 	//void ArcBugcheckInit(void);
