@@ -1104,6 +1104,50 @@ static void ARC_NORETURN IopUsbmsTest(void) {
 	}
 	while (1);
 }
+
+static void UnalignedStoresTest(ULONG size) {
+	const ULONG write32 = 0x12345678;
+	volatile UCHAR* ptr = (volatile UCHAR*)0x6000C000;
+	volatile UCHAR reference_buffer[32];
+	bool unaligned_broken = false;
+	for (ULONG i = 0; i <= 28; ++i) {
+		for (ULONG fill = 0; i < 32; i += 4) NativeWriteBase32(ptr, i, 0);
+		memset(reference_buffer, 0, sizeof(reference_buffer));
+
+		switch (size) {
+		case 1:
+			NativeWriteBase8(ptr, i, write32);
+			break;
+		case 2:
+			NativeWriteBase16(ptr, i, write32);
+			break;
+		case 4:
+			NativeWriteBase32(ptr, i, write32);
+			break;
+		}
+
+		switch (size) {
+		case 1:
+			NativeWriteBase8(reference_buffer, i, write32);
+			break;
+		case 2:
+			NativeWriteBase16(reference_buffer, i, write32);
+			break;
+		case 4:
+			NativeWriteBase32(reference_buffer, i, write32);
+			break;
+		}
+
+		if (memcmp(ptr, reference_buffer, sizeof(reference_buffer)) != 0) {
+			printf("Got erratum for %x(%d-byte): %08x %08x %08x %08x %08x %08x %08x %08x\r\n", i, size,
+				NativeReadBase32(ptr, 0), NativeReadBase32(ptr, 4), NativeReadBase32(ptr, 8), NativeReadBase32(ptr, 0xC),
+				NativeReadBase32(ptr, 0x10), NativeReadBase32(ptr, 0x14), NativeReadBase32(ptr, 0x18), NativeReadBase32(ptr, 0x1C));
+			unaligned_broken = true;
+		}
+	}
+
+	if (!unaligned_broken) printf("Unaligned stores fine for %d-byte\r\n", size);
+}
 #endif
 
 //---------------------------------------------------------------------------------
@@ -1136,7 +1180,17 @@ void ARC_NORETURN FwMain(PHW_DESCRIPTION Desc) {
 		MmioWriteBase32((PVOID)0x6C200000, 0x698C, 3);
 	}
 	// Initialise the console. We know where it is. Just convert it from physical address to our BAT mapping.
-	ArcConsoleInit(MEM_PHYSICAL_TO_K1(Desc->FrameBufferBase), SystemType == ARTX_SYSTEM_LATTE ? 60 : 20, SystemType == ARTX_SYSTEM_LATTE ? 60 : 20, Desc->FrameBufferWidth, Desc->FrameBufferHeight, Desc->FrameBufferStride);
+	ArcConsoleInit(MEM_PHYSICAL_TO_K1(Desc->FrameBufferBase), 20, 20, Desc->FrameBufferWidth, Desc->FrameBufferHeight, Desc->FrameBufferStride);
+	if (SystemType == ARTX_SYSTEM_LATTE) {
+		printf("\r\n\n\n");
+
+#if 0
+		// Check for the 60x bus erratum.
+		UnalignedStoresTest(1);
+		UnalignedStoresTest(2);
+		UnalignedStoresTest(4);
+#endif
+	}
 	
 	// Initialise the exception handlers.
 	//void ArcBugcheckInit(void);

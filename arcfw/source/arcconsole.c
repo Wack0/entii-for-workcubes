@@ -124,7 +124,7 @@ static void __console_drawc(int c)
 	if (s_is_rgb) {\
 		if (bits & (x)) color = fgcolor;\
 		else color = bgcolor;\
-		_Mmio_Write32Impl(ptr, 0, color, 1, 0);\
+		*ptr = __builtin_bswap32(color);\
 		/* NativeWrite32(ptr, color); */\
 		ptr++;\
 		break;\
