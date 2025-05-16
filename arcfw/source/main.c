@@ -1118,6 +1118,13 @@ void ARC_NORETURN FwMain(PHW_DESCRIPTION Desc) {
 	MmioWriteBase32((PVOID)0x6C000000, 0x3004, 0); // PI_INTMASK = 0
 	MmioWriteBase32((PVOID)0x6C000000, 0x3000, 0xFFFFFFFF); // PI_INTSTATUS = 0xFFFFFFFF
 
+	// Determine system type.
+	ARTX_SYSTEM_TYPE SystemType = ARTX_SYSTEM_FLIPPER;
+	if ((Desc->FpFlags & FPF_IS_VEGAS) != 0) SystemType = ARTX_SYSTEM_VEGAS;
+	if ((Desc->FpFlags & FPF_IS_LATTE) != 0) SystemType = ARTX_SYSTEM_LATTE;
+
+	// Latte uses an RGB framebuffer, not a YUV one.
+	if (SystemType == ARTX_SYSTEM_LATTE) ArcConsoleUseRgb();
 	// Initialise the console. We know where it is. Just convert it from physical address to our BAT mapping.
 	ArcConsoleInit(MEM_PHYSICAL_TO_K1(Desc->FrameBufferBase), 20, 20, Desc->FrameBufferWidth, Desc->FrameBufferHeight, Desc->FrameBufferStride);
 	
@@ -1125,10 +1132,6 @@ void ARC_NORETURN FwMain(PHW_DESCRIPTION Desc) {
 	//void ArcBugcheckInit(void);
 	//ArcBugcheckInit();
 
-	// Determine system type.
-	ARTX_SYSTEM_TYPE SystemType = ARTX_SYSTEM_FLIPPER;
-	if ((Desc->FpFlags & FPF_IS_VEGAS) != 0) SystemType = ARTX_SYSTEM_VEGAS;
-	if ((Desc->FpFlags & FPF_IS_LATTE) != 0) SystemType = ARTX_SYSTEM_LATTE;
 
 	// Initialise ARC memory descriptors. 
 	if (ArcMemInitDescriptors(Desc) < 0) {
@@ -1172,6 +1175,7 @@ void ARC_NORETURN FwMain(PHW_DESCRIPTION Desc) {
 		printf("Init pxi...\r\n");
 		PxiInit();
 		PxiHeapInit(Desc->DdrIpcBase, Desc->DdrIpcLength);
+		printf("Init sdmc...\r\n");
 		SdmcStartup();
 		printf("Init IOS USBv5...\r\n");
 		if (UlInit() >= 0) {
