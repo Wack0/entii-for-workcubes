@@ -39,6 +39,29 @@ typedef struct _PXI_REGISTERS {
 
 _Static_assert(sizeof(PXI_REGISTERS) == 0x38);
 
+typedef struct _PXI_REGISTERS_CPU {
+	PXI_CORE_REGISTERS Request, Response;
+} PXI_REGISTERS_CPU, *PPXI_REGISTERS_CPU;
+
+_Static_assert(sizeof(PXI_REGISTERS_CPU) == 0x10);
+
+typedef struct _INTERRUPT_REGISTERS_CPU {
+	ULONG Cause[2];
+	ULONG Mask[2];
+} INTERRUPT_REGISTERS_CPU, *PINTERRUPT_REGISTERS_CPU;
+
+_Static_assert(sizeof(INTERRUPT_REGISTERS_CPU) == 0x10);
+
+typedef struct _PXI_REGISTERS_LATTE {
+	PXI_REGISTERS Vegas;
+	ULONG Reserved[(0x400 - 0x38) / sizeof(ULONG)];
+	PXI_REGISTERS_CPU PerCore[3];
+	ULONG Reserved2[(0x440 - 0x430) / sizeof(ULONG)];
+	INTERRUPT_REGISTERS_CPU Interrupt[3];
+} PXI_REGISTERS_LATTE, *PPXI_REGISTERS_LATTE;
+
+_Static_assert(sizeof(PXI_REGISTERS_LATTE) == 0x470);
+
 enum {
 	VEGAS_INTERRUPT_GPIO = BIT(10),
 	VEGAS_INTERRUPT_PXI = BIT(30)
@@ -48,7 +71,10 @@ enum {
 	PXI_REGISTER_BASE = 0x0d800000
 };
 
+static bool PxipIsLatte(void);
+
 #define PxiRegisters ((PPXI_REGISTERS)MEM_PHYSICAL_TO_K1(PXI_REGISTER_BASE))
+#define PxiRegistersLatte ((PPXI_REGISTERS_LATTE)PxiRegisters)
 
 #define PXI_REQUEST_READ() MmioReadBase32( MMIO_OFFSET(PxiRegisters, Request.Message) )
 #define PXI_REQUEST_WRITE(x) MmioWriteBase32( MMIO_OFFSET(PxiRegisters, Request.Message), (ULONG)((x)) )
@@ -60,8 +86,14 @@ enum {
 	PXI_CONTROL_WRITE(Control); \
 } while (false)
 #define PXI_RESPONSE_READ() MmioReadBase32( MMIO_OFFSET(PxiRegisters, Response.Message) )
-#define VEGAS_INTERRUPT_MASK_SET(x) MmioWriteBase32( MMIO_OFFSET(PxiRegisters, InterruptMask), (ULONG)((x)) )
-#define VEGAS_INTERRUPT_CLEAR(x) MmioWriteBase32( MMIO_OFFSET(PxiRegisters, InterruptCause), (ULONG)((x)) )
+#define VEGAS_INTERRUPT_MASK_SET(x) do { \
+	MmioWriteBase32( MMIO_OFFSET(PxiRegisters, InterruptMask), (ULONG)((x)) ); \
+	if (PxipIsLatte()) MmioWriteBase32( MMIO_OFFSET(PxiRegistersLatte, Interrupt[0].Mask), (ULONG)((x)) ); \
+} while (0)
+#define VEGAS_INTERRUPT_CLEAR(x) do { \
+	MmioWriteBase32( MMIO_OFFSET(PxiRegisters, InterruptCause), (ULONG)((x)) ); \
+	if (PxipIsLatte()) MmioWriteBase32( MMIO_OFFSET(PxiRegistersLatte, Interrupt[0].Cause), (ULONG)((x)) ); \
+} while (0)
 
 static void PxiEnsureRepliesAsync(void);
 
@@ -301,8 +333,11 @@ static const PPXI_DESC s_pIpcDescAsyncs[] = { &s_IpcDescAsync, &s_IpcDescAsync2,
 static IOS_OPERATION s_IpcAsyncOperation[4] = { IOSOP_NONE, IOSOP_NONE, IOSOP_NONE, IOSOP_NONE };
 static bool s_IpcAsyncCompleted[4] = { false, false, false, false };
 static bool s_IpcSyncCompleted = false;
+static bool s_IsLatte = false;
 
 static BYTE s_IpcBuffer[PAGE_SIZE] __attribute__((aligned(PAGE_SIZE)));
+
+static bool PxipIsLatte(void) { return s_IsLatte; }
 
 static void PxiEnsureRepliesAsync(void) {
 	if (!PxiResDone()) return;
@@ -958,9 +993,27 @@ bool PxiIopIoctlvAsyncActive(ULONG index) {
 	return index < sizeof(s_IpcAsyncCompleted) && s_IpcAsyncOperation[index] == IOS_IOCTLV;
 }
 
-void PxiInit(void) {
+void PxiInit(ARTX_SYSTEM_TYPE SystemType) {
 	// Unmask interrupts at the PXI block.
 	PXI_CONTROL_SET(PXI_BITS_PRESERVE);
+
+	if (SystemType == ARTX_SYSTEM_LATTE) {
+		s_IsLatte = true;
+		// Wait for IOS kernel init.
+		while (NativeReadBase32(MEM_PHYSICAL_TO_K1(0), 0x314C) == 0) {
+			udelay(1000);
+		}
+
+		// Finish up the IOS reboot sequence.
+		PxiWaitReqInProgress();
+		PxiIntClear();
+		PxiReqAck();
+		PxiResFinished();
+
+		// Wait a while for IOS to fully init.
+		udelay(1000000);
+	}
+
 	// Cleanup any existing IPC transactions
 	for (int i = 0; i < 10; i++) {
 		PxiCleanupRequest();
