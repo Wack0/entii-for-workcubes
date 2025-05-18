@@ -55,21 +55,21 @@ static const unsigned int color_table_yuv[] =
 static const unsigned int color_table_rgb[] =
 {
   0x00000000,		// 30 normal black
-  0xaa000000,		// 31 normal red
-  0x00aa0000,		// 32 normal green
-  0xaaaa0000,		// 33 normal yellow
-  0x0000aa00,		// 34 normal blue
-  0xaa00aa00,		// 35 normal magenta
-  0x00aaaa00,		// 36 normal cyan
-  0xaaaaaa00,		// 37 normal white
-  0x55555500,		// 30 bright black
-  0xff555500,		// 31 bright red
-  0x55ff5500,		// 32 bright green
-  0xffff5500,		// 33 bright yellow
-  0x5555ff00,		// 34 bright blue
-  0xff55ff00,		// 35 bright magenta
-  0x55ffff00,		// 36 bright cyan
-  0xffffff00,		// 37 bright white
+  0x00aa0000,		// 31 normal red
+  0x0000aa00,		// 32 normal green
+  0x00aaaa00,		// 33 normal yellow
+  0x000000aa,		// 34 normal blue
+  0x00aa00aa,		// 35 normal magenta
+  0x0000aaaa,		// 36 normal cyan
+  0x00aaaaaa,		// 37 normal white
+  0x00555555,		// 30 bright black
+  0x00ff5555,		// 31 bright red
+  0x0055ff55,		// 32 bright green
+  0x00ffff55,		// 33 bright yellow
+  0x005555ff,		// 34 bright blue
+  0x00ff55ff,		// 35 bright magenta
+  0x0055ffff,		// 36 bright cyan
+  0x00ffffff,		// 37 bright white
 };
 
 static struct _console_data_s stdcon;
@@ -124,7 +124,7 @@ static void __console_drawc(int c)
 	if (s_is_rgb) {\
 		if (bits & (x)) color = fgcolor;\
 		else color = bgcolor;\
-		*ptr = __builtin_bswap32(color);\
+		*ptr = color;\
 		/* NativeWrite32(ptr, color); */\
 		ptr++;\
 		break;\
