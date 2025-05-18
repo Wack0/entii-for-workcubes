@@ -26,7 +26,7 @@ void setup_timers(ULONG DecrementerFreq)
 
 void udelay(unsigned int usecs)
 {
-	_wait_ticks(timer_freq_usecs);
+	_wait_ticks(timer_freq_usecs * usecs);
 }
 
 unsigned long long currticks(void) {
