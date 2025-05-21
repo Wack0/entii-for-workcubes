@@ -8,7 +8,6 @@
 VOID HalpDisplayCharacter(IN UCHAR Character);
 VOID HalpOutputCharacter(IN PUCHAR Glyph);
 extern ULONG HalpInitPhase;
-extern PPI_INTERRUPT_REGS HalpPiInterruptRegs;
 
 static PFRAME_BUFFER s_FbConfig;
 static PVOID s_FrameBuffer = NULL;
@@ -41,7 +40,10 @@ enum {
 	COLOUR_BACKGROUND_LOW = 0x00002900,
 	COLOUR_FOREGROUND_LOW = 0x0000EB00,
 	COLOUR_BACKGROUND_HIGH = 0x29F0006E,
-	COLOUR_FOREGROUND_HIGH = 0xEB800080
+	COLOUR_FOREGROUND_HIGH = 0xEB800080,
+	
+	COLOUR_BACKGROUND_RGB = 0x000000ff,
+	COLOUR_FOREGROUND_RGB = 0x00ffffff,
 };
 
 // static const UCHAR sc_Background[] = { 0x29, 0xF0, 0x29, 0x6E }; // bright blue
@@ -49,9 +51,11 @@ enum {
 
 static void ViWipeScreen(void) {
 	// fill in the whole framebuffer with sc_Background
-	ULONG Count = (s_FbConfig->Width * s_FbConfig->Height) / 2;
+	BOOLEAN IsCafe = HalpSystemIsCafe();
+	ULONG Count = (s_FbConfig->Width * s_FbConfig->Height);
+	if (!IsCafe) Count /= 2;
 	volatile ULONG* Fb = (volatile ULONG*)((ULONG)s_FrameBuffer);
-	register ULONG bg = COLOUR_BACKGROUND;
+	register ULONG bg = IsCafe ? COLOUR_BACKGROUND_RGB : COLOUR_BACKGROUND;
 	while (Count--) {
 		NativeWrite32(Fb, bg);
 		Fb++;
@@ -180,15 +184,17 @@ static void HalpDisplayOwnByHal(void) {
 	if (HalpDisplayOwnedByHal) return;
 	
 	HalpDisplayOwnedByHal = TRUE;
-	// Disable VI/PEFinish interrupts.
-	HalpDisableDeviceInterruptHandler(VECTOR_VI);
-	//HalpDisableDeviceInterruptHandler(VECTOR_PE_FINISH);
-	// Wait for GPU to be done
-	//HalpDisplayWaitAbortPe();
-	// Tell GPU to stop rendering
-	MmioWriteBase32(MMIO_OFFSET(HalpPiInterruptRegs, CpAbort), TRUE);
-	// Wait a bit
-	//HalpDisplayAbortWait(1000);
+	if (!HalpSystemIsCafe()) {
+		// Disable VI/PEFinish interrupts.
+		HalpDisableDeviceInterruptHandler(VECTOR_VI);
+		//HalpDisableDeviceInterruptHandler(VECTOR_PE_FINISH);
+		// Wait for GPU to be done
+		//HalpDisplayWaitAbortPe();
+		// Tell GPU to stop rendering
+		MmioWriteBase32(MMIO_OFFSET(HalpPiInterruptRegs, CpAbort), TRUE);
+		// Wait a bit
+		//HalpDisplayAbortWait(1000);
+	}
 	ViWipeScreen();
 	HalpColumn = 1;
 	HalpRow = 3;
@@ -221,9 +227,11 @@ VOID HalpDisplayCharacter(IN UCHAR Character) {
 				HalpScrollLength
 			);
 			volatile ULONG* Destination = (volatile ULONG*)((ULONG)s_FrameBuffer + HalpScrollLength);
-			register ULONG bg = COLOUR_BACKGROUND;
+			BOOLEAN IsCafe = HalpSystemIsCafe();
+			register ULONG bg = IsCafe ? COLOUR_BACKGROUND_RGB : COLOUR_BACKGROUND;
 			for (ULONG Index = 0; Index < (HalpScrollLine / 2); Index++) {
-				NativeWriteBase32(Destination, Index * sizeof(*Destination), bg);
+				if (IsCafe) Destination[Index] = bg;
+				else NativeWriteBase32(Destination, Index * sizeof(*Destination), bg);
 			}
 		}
 		return;
@@ -296,7 +304,8 @@ HalpOutputCharacter(
 	}
 	
 	// Output the character and update the cursor column.
-	ULONG Offset = (HalpRow * HalpScrollLine) + (HalpColumn * HalpCharacterWidth * 2);
+	register BOOLEAN IsCafe = HalpSystemIsCafe();
+	ULONG Offset = (HalpRow * HalpScrollLine) + (HalpColumn * HalpCharacterWidth * (IsCafe ? 4 : 2));
 	volatile ULONG* Destination = (volatile ULONG*)((ULONG)s_FrameBuffer + Offset);
 	
 	ULONG Stride = HalpStride;
@@ -308,11 +317,22 @@ HalpOutputCharacter(
 		Glyph++;
 		for (ULONG charBit = 0; charBit < HalpCharacterWidth; charBit += 2) {
 			UCHAR bit = (FontValue >> 31);
-			register ULONG colour = (bit == 1 ? COLOUR_FOREGROUND_HIGH : COLOUR_BACKGROUND_HIGH);
-			FontValue <<= 1;
-			bit = (FontValue >> 31);
-			colour |= (bit == 1 ? COLOUR_FOREGROUND_LOW : COLOUR_BACKGROUND_LOW);
-			NativeWrite32(Destination, colour);
+			register ULONG colour = 0;
+			if (IsCafe) {
+				colour = (bit == 1 ? COLOUR_FOREGROUND_RGB : COLOUR_BACKGROUND_RGB);
+				FontValue <<= 1;
+				bit = (FontValue >> 31);
+				*Destination = colour;
+				Destination++;
+				colour = (bit == 1 ? COLOUR_FOREGROUND_RGB : COLOUR_BACKGROUND_RGB);
+				*Destination = colour;
+			} else {
+				colour = (bit == 1 ? COLOUR_FOREGROUND_HIGH : COLOUR_BACKGROUND_HIGH);
+				FontValue <<= 1;
+				bit = (FontValue >> 31);
+				colour |= (bit == 1 ? COLOUR_FOREGROUND_LOW : COLOUR_BACKGROUND_LOW);
+				NativeWrite32(Destination, colour);
+			}
 			Destination++;
 			//Destination += 2; //4;
 			FontValue <<= 1;

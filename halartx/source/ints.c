@@ -7,15 +7,15 @@ enum {
 	MAX_IRQL_NUM = 32
 };
 
-PPI_INTERRUPT_REGS HalpPiInterruptRegs = NULL;
+extern ULONG HalpInitPhase;
+
+PI_INTERRUPT_REGS_BOTH HalpPiInterruptRegsBoth = {NULL};
+
 IDTUsage        HalpIDTUsage[MAXIMUM_IDTVECTOR];
 KINTERRUPT HalpMachineCheckInterrupt;
 KSPIN_LOCK HalpSystemInterruptLock;
 
 BOOLEAN HalpInEmulator = FALSE;
-
-// MPNOTE: This should be in the PCR.
-ULONG HalpRegisteredInterrupts = 0;
 
 // Table that converts IRQL to interrupt mask register.
 // Generated based on HalpInterruptToIrql by HalpInitPriorityMask
@@ -43,6 +43,8 @@ const ULONG HalpInterruptToIrql[MAX_IRQL_NUM] = {
 	25, // DEBUG
 	19, // HIGHSPEED_PORT (gone from RVL)
 	21, // VEGAS (IOS IPC)
+	13, // (15)
+	13, // (16)
 	16, 16, 16, // CP_FIFO for each core
 	29, 29, 29, // IPI
 	20, // GPU7
@@ -151,10 +153,16 @@ void HalDisableSystemInterrupt(ULONG Vector, KIRQL Irql) {
 		// Turn the interrupt off in our array
 		ULONG BitMask = ~(BIT(Vector));
 		HalpRegisteredInterrupts &= BitMask;
-		// ...and mask it in flipper
-		MmioWriteBase32(MMIO_OFFSET(HalpPiInterruptRegs, Mask),
-			MmioReadBase32(MMIO_OFFSET(HalpPiInterruptRegs, Mask)) & BitMask
-		);
+		// ...and mask it in flipper or latte
+		if (HalpSystemIsCafe()) {
+			MmioWriteBase32(MMIO_PILT_OFFSET(Mask),
+				MmioReadBase32(MMIO_PILT_OFFSET(Mask)) & BitMask
+			);
+		} else {
+			MmioWriteBase32(MMIO_OFFSET(HalpPiInterruptRegs, Mask),
+				MmioReadBase32(MMIO_OFFSET(HalpPiInterruptRegs, Mask)) & BitMask
+			);
+		}
 	}
 	
 	KiReleaseSpinLock(&HalpSystemInterruptLock);
@@ -182,9 +190,15 @@ BOOLEAN HalEnableSystemInterrupt(ULONG Vector, KIRQL Irql, KINTERRUPT_MODE Inter
 		ULONG BitMask = BIT(Vector);
 		HalpRegisteredInterrupts |= BitMask;
 		// ...and unmask it in flipper
-		MmioWriteBase32(MMIO_OFFSET(HalpPiInterruptRegs, Mask),
-			MmioReadBase32(MMIO_OFFSET(HalpPiInterruptRegs, Mask)) | BitMask
-		);
+		if (HalpSystemIsCafe()) {
+			MmioWriteBase32(MMIO_PILT_OFFSET(Mask),
+				MmioReadBase32(MMIO_PILT_OFFSET(Mask)) | BitMask
+			);
+		} else {
+			MmioWriteBase32(MMIO_OFFSET(HalpPiInterruptRegs, Mask),
+				MmioReadBase32(MMIO_OFFSET(HalpPiInterruptRegs, Mask)) | BitMask
+			);
+		}
 	}
 	
 	KiReleaseSpinLock(&HalpSystemInterruptLock);
@@ -204,6 +218,12 @@ BOOLEAN HalEnableSystemInterrupt(ULONG Vector, KIRQL Irql, KINTERRUPT_MODE Inter
 	({ ULONG result; \
 	__asm__ volatile ("mfdec %0" : "=r" (result)); \
 	/*return*/ result; })
+	
+BOOLEAN HalpHandleIpiInterrupt(
+	IN PKINTERRUPT Interrupt,
+	IN PVOID ServiceContext,
+	IN PVOID TrapFrame
+);
 
 BOOLEAN HalpHandleExternalInterrupt(
 	IN PKINTERRUPT Interrupt,
@@ -213,19 +233,31 @@ BOOLEAN HalpHandleExternalInterrupt(
 	// Check if this is really an IPI.
 	if (HalpCpuIsEspresso()) {
 		ULONG CoreId = __mfspr(SPR_PIR);
+		// HACK: for CPU not 0, if phase is nonzero and BATs aren't set then do it
+		if (CoreId != 0 && HalpInitPhase != 0 && !HALPCR->SetBat) {
+			HALPCR->SetBat = 1;
+			extern void HalpSetMmioDbat();
+			HalpSetMmioDbat();
+		}
 		if (CoreId < 3) {
-			if (CoreId != 1) CoreId ^= 2; // flip coreid from 0,1,2 to 2,1,0 as per bit order in SCR
-			ULONG IpiMaskInverted = (__mfspr(SPR_SCR) >> SCR_IPI_BIT);
-			if ((IpiMaskInverted & BIT(CoreId)) != 0) {
-				// this is an IPI
-				KeIpiInterrupt(TrapFrame);
-				return TRUE;
+			ULONG IpiBit = (SCR_IPI_BIT + 3 - 1) - CoreId;
+			if ((__mfspr(SPR_SCR) & BIT(IpiBit)) != 0) {
+				// this is an IPI, try to handle it
+				return HalpHandleIpiInterrupt(Interrupt, ServiceContext, TrapFrame);
 			}
 		}
 	}
+	BOOLEAN IsCafe = HalpSystemIsCafe();
 	// Read the interrupt cause and mask.
-	ULONG Cause = MmioReadBase32(MMIO_OFFSET(HalpPiInterruptRegs, Cause));
-	ULONG Mask = MmioReadBase32(MMIO_OFFSET(HalpPiInterruptRegs, Mask));
+	ULONG Cause = 0;
+	ULONG Mask = 0;
+	if (IsCafe) {
+		Cause = MmioReadBase32(MMIO_PILT_OFFSET(Cause));
+		Mask = MmioReadBase32(MMIO_PILT_OFFSET(Mask));
+	} else {
+		Cause = MmioReadBase32(MMIO_OFFSET(HalpPiInterruptRegs, Cause));
+		Mask = MmioReadBase32(MMIO_OFFSET(HalpPiInterruptRegs, Mask));
+	}
 	
 	// Mask off the reset switch value.
 	Cause &= ~BIT(16);
@@ -273,14 +305,16 @@ BOOLEAN HalpHandleExternalInterrupt(
 	// before the handler can actually ack the interrupt in the device if needed.
 	BOOLEAN IntRegistered = (HalpRegisteredInterrupts & CurrentMask) != 0;
 	if (IntRegistered) HalpRegisteredInterrupts &= ~CurrentMask;
-	// MP NOTE: there should be multiple sets of HalpRegisteredInterrupts for each cpu!
-	MmioWriteBase32(MMIO_OFFSET(HalpPiInterruptRegs, Mask), (HalpIrqlToMask[Irql] & HalpRegisteredInterrupts));
+	if (IsCafe) MmioWriteBase32(MMIO_PILT_OFFSET(Mask), (HalpIrqlToMask[Irql] & HalpRegisteredInterrupts));
+	else MmioWriteBase32(MMIO_OFFSET(HalpPiInterruptRegs, Mask), (HalpIrqlToMask[Irql] & HalpRegisteredInterrupts));
 	
 	// Acknowledge the handled interrupt, if it's possible to do so here
 	// Only interrupt 0-1,12,13 can be acked here,
 	// but Dolphin emulates the register incorrectly (for now);
 	// and allows all interrupts to be acked here.
-	MmioWriteBase32(MMIO_OFFSET(HalpPiInterruptRegs, Cause), CurrentMask);
+	// TODO: what interrupts are allowed to be acked here on latte?
+	if (IsCafe) MmioWriteBase32(MMIO_PILT_OFFSET(Cause), CurrentMask);
+	else MmioWriteBase32(MMIO_OFFSET(HalpPiInterruptRegs, Cause), CurrentMask);
 	
 	// If the new IRQL level is lower than CLOCK2,
 	// allow decrementer interrupts by reenabling interrupts.
@@ -321,7 +355,8 @@ BOOLEAN HalpHandleExternalInterrupt(
 	
 	// Lower the IRQL
 	PCR->CurrentIrql = OldIrql;
-	MmioWriteBase32(MMIO_OFFSET(HalpPiInterruptRegs, Mask), Mask);
+	if (IsCafe) MmioWriteBase32(MMIO_PILT_OFFSET(Mask), Mask);
+	else MmioWriteBase32(MMIO_OFFSET(HalpPiInterruptRegs, Mask), Mask);
 	return ret;
 }
 
@@ -334,8 +369,11 @@ static BOOLEAN HalpAcknowledgeIpi(void) {
 	
 	// Clear IPI bit for this core
 	ULONG SCR = __mfspr(SPR_SCR);
-	SCR &= ~BIT(SCR_IPI_BIT + 2 - PIR);
-	__mtspr(SPR_SCR, SCR);
+	ULONG BitMask = BIT(SCR_IPI_BIT + 3 - 1 - PIR);
+	while ((SCR & BitMask) != 0) {
+		__mtspr(SPR_SCR, SCR & ~BitMask);
+		SCR = __mfspr(SPR_SCR);
+	}
 	
 	return TRUE;
 }
@@ -357,7 +395,8 @@ BOOLEAN HalpHandleIpiInterrupt(
 // Map the PI interrupt registers (stage 0)
 static BOOLEAN HalpMapInterruptRegs0(void) {
 	if (HalpPiInterruptRegs != NULL) return TRUE;
-	HalpPiInterruptRegs = KePhase0MapIo(PI_INTERRUPT_REGS_BASE, sizeof(PI_INTERRUPT_REGS));
+	if (HalpSystemIsCafe()) HalpPiInterruptRegsLatte = KePhase0MapIo(PI_INTERRUPT_REGS_LATTE_BASE, sizeof(PI_INTERRUPT_REGS_LATTE));
+	else HalpPiInterruptRegs = KePhase0MapIo(PI_INTERRUPT_REGS_BASE, sizeof(PI_INTERRUPT_REGS));
 	return HalpPiInterruptRegs != NULL;
 }
 
@@ -368,17 +407,26 @@ BOOLEAN HalpMapInterruptRegs(void) {
 	// Map the registers via the NT memory manager.
 	PHYSICAL_ADDRESS physAddr;
 	physAddr.HighPart = 0;
-	physAddr.LowPart = PI_INTERRUPT_REGS_BASE;
-	HalpPiInterruptRegs = (PPI_INTERRUPT_REGS)
-		MmMapIoSpace(physAddr, sizeof(PI_INTERRUPT_REGS), FALSE);
+	BOOLEAN IsLatte = HalpSystemIsCafe();
+	if (IsLatte) {
+		physAddr.LowPart = PI_INTERRUPT_REGS_LATTE_BASE;
+		HalpPiInterruptRegsLatte = (PPI_INTERRUPT_REGS_LATTE)
+			MmMapIoSpace(physAddr, sizeof(PI_INTERRUPT_REGS_LATTE), FALSE);
+	} else {
+		physAddr.LowPart = PI_INTERRUPT_REGS_BASE;
+		HalpPiInterruptRegs = (PPI_INTERRUPT_REGS)
+			MmMapIoSpace(physAddr, sizeof(PI_INTERRUPT_REGS), FALSE);
+	}
 	
 	// Ensure any BAT mapping is gone.
 	// Do this after mapping by page tables:
 	// if unmap happens first, an interrupt in MmMapIoSpace is death.
 	if (HasBatMapping) {
-		KePhase0DeleteIoMap(PI_INTERRUPT_REGS_BASE, sizeof(PI_INTERRUPT_REGS));
+		if (IsLatte) KePhase0DeleteIoMap(PI_INTERRUPT_REGS_LATTE_BASE, sizeof(PI_INTERRUPT_REGS_LATTE));
+		else KePhase0DeleteIoMap(PI_INTERRUPT_REGS_BASE, sizeof(PI_INTERRUPT_REGS));
 	}
 	
+	// HalpPiInterruptRegs is part of a union with HalpPiInterruptRegsLatte, so this will just work.
 	if (HalpPiInterruptRegs == NULL) return FALSE;
 	return TRUE;
 }
@@ -422,9 +470,6 @@ BOOLEAN HalpCreateSioStructures(void) {
 	// Ensure interrupts are disabled.
 	_disable();
 	
-	// Ensure the IRQL to interrupt mask table is initialised.
-	HalpInitPriorityMask();
-	
 	// Initialise the Machine Check interrupt handler
 	if (HalpEnableInterruptHandler(&HalpMachineCheckInterrupt,
 									HalpHandleMachineCheck,
@@ -435,7 +480,7 @@ BOOLEAN HalpCreateSioStructures(void) {
 									MACHINE_CHECK_LEVEL,
 									Latched,
 									FALSE,
-									0,
+									HALPCR->PhysicalProcessor,
 									FALSE,
 									InternalUsage,
 									MACHINE_CHECK_VECTOR
@@ -448,7 +493,12 @@ BOOLEAN HalpCreateSioStructures(void) {
 	HalpRegisterVector(InternalUsage, EXTERNAL_INTERRUPT_VECTOR, EXTERNAL_INTERRUPT_VECTOR, HIGH_LEVEL);
 	
 	// Initialise the decrementer handler
-	PCR->InterruptRoutine[DECREMENT_VECTOR] = (PKINTERRUPT_ROUTINE)HalpHandleDecrementerInterrupt;
+	if (HALPCR->PhysicalProcessor == 0) {
+		PCR->InterruptRoutine[DECREMENT_VECTOR] = (PKINTERRUPT_ROUTINE)HalpHandleDecrementerInterrupt;
+	} else {
+		extern BOOLEAN HalpHandleDecrementerInterrupt1(IN PKINTERRUPT Interrupt, PVOID ServiceContext, PVOID TrapFrame);
+		PCR->InterruptRoutine[DECREMENT_VECTOR] = (PKINTERRUPT_ROUTINE)HalpHandleDecrementerInterrupt1;
+	}
 	
 	// Initialise the decrementer itself.
 	HalpUpdateDecrementer(1000);
@@ -465,16 +515,27 @@ BOOLEAN HalpInitialiseInterrupts(void) {
 		// Map the PI interrupt registers for stage 0 init.
 		if (!HalpMapInterruptRegs0()) return FALSE;
 		
-		// Ensure all hardware interrupts are disabled.
-		MmioWriteBase32(MMIO_OFFSET(HalpPiInterruptRegs, Mask), 0);
-		HalpRegisteredInterrupts = 0;
-		
 		// Get the emulator status passed to us from arc firmware
 		HalpInEmulator = RUNTIME_BLOCK[RUNTIME_IN_EMULATOR] != FALSE;
+		
+		// Ensure the IRQL to interrupt mask table is initialised.
+		HalpInitPriorityMask();
+		
+		if (HalpSystemIsCafe()) MmioWriteBase32(MMIO_OFFSET(HalpPiInterruptRegsLatte, Global.Mask), 0);
 	}
+		
+	// Ensure all hardware interrupts are disabled.
+	if (HalpSystemIsCafe()) MmioWriteBase32(MMIO_PILT_OFFSET(Mask), 0);
+	else if (HALPCR->PhysicalProcessor == 0) MmioWriteBase32(MMIO_OFFSET(HalpPiInterruptRegs, Mask), 0);
+	HalpRegisteredInterrupts = 0;
 	
 	// Reserve the external interrupt vector for the HAL
 	PCR->ReservedVectors |= (1 << EXTERNAL_INTERRUPT_VECTOR);
+	
+	// For CPUs that are not CPU 0, initialise the interrupt vectors.
+	if (HALPCR->PhysicalProcessor != 0) {
+		HalpCreateSioStructures();
+	}
 	
 	return TRUE;
 }

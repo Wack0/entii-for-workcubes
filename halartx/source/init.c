@@ -13,7 +13,6 @@ BOOLEAN HalpFixLowMem(PLOADER_PARAMETER_BLOCK LoaderBlock);
 extern KSPIN_LOCK HalpDisplayAdapterLock;
 extern KSPIN_LOCK HalpSystemInterruptLock;
 
-
 NTHALAPI
 BOOLEAN
 HalInitSystem (
@@ -138,6 +137,7 @@ HalInitSystem (
 		// due to a hardware erratum, a sync instruction must be placed before the load/store instruction;
 		// thus any kind of exception after the sync instruction and before the actual load/store will cause hangs/crashes.
 		HalpSetMmioDbat();
+		HALPCR->SetBat = TRUE;
 		
 		return TRUE;
 		
@@ -171,7 +171,7 @@ HalInitializeProcessor (
 	#endif
 	
 	// Do espresso-specific init if needed.
-	if (ProcessorType == 0x7001) {
+	if (ProcessorType == 0x7001 && !HalpSystemIsCafe()) {
 		// Enable PIR and make sure HID5 is enabled.
 		ULONG HID5 = __mfspr(SPR_HID5);
 		HID5 |= HID5_H5A | HID5_PIRE;

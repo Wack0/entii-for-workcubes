@@ -7,6 +7,7 @@
 #include "runtime.h"
 #include "ppcinst.h"
 #include "peimage.h"
+#include "halpsys.h"
 
 static const char s_Real0StartPattern[] = "PowerPC";
 
@@ -120,6 +121,9 @@ BOOLEAN HalpFixLowMem(PLOADER_PARAMETER_BLOCK LoaderBlock) {
 		Length += sizeof(ULONG);
 	}
 	
+	// Copy from low memory to real0.
+	memcpy(Real0, (void*)0x80000000, Length + 0x3010);
+	
 	memcpy(&Real0[0x2000], &Real0[0x3010], Length);
 	// Relocate any backwards branches in this range.
 	{
@@ -178,26 +182,17 @@ BOOLEAN HalpFixLowMem(PLOADER_PARAMETER_BLOCK LoaderBlock) {
 		if (ExhIndex == 0 && ExhOffset > 0x300) ExhIndex++;
 	}
 	
-	// Is this an Espresso CPU?
+	// Is this an Espresso CPU, in Cafe mode?
 	BOOLEAN IsMultiprocessorEspresso = FALSE;
-	ULONG ProcessorType;
-	asm volatile("mfpvr %0\n" : "=r" (ProcessorType));
-	ProcessorType >>= 16;
-	if (ProcessorType == 0x7001) {
+	if (HalpCpuIsEspresso()) { //if (HalpSystemIsCafe()) {
 		// Is this a multiprocessor kernel?
 		// In this case, some instructions were placed in a code cave at real0.
 		// Otherwise, real0+8 is zero.
 		IsMultiprocessorEspresso = (*(PULONG)&Real0[8] != 0);
 	}
 	
-	// If this is multiprocessor espresso, copy 0x500 to 0x1700
-	// 0x1700 is the Espresso-specific IPI handler.
-	// Most older multiprocessor powerpc systems handle IPIs as an external interrupt.
-	// Therefore, we shall do the same.
+	// If this is multiprocessor espresso, hook the kernel's PE loader.
 	if (IsMultiprocessorEspresso) {
-		memcpy(&Real0[0x1700], &Real0[0x500], 0x100);
-		
-		// Additionally, the kernel's PE loader needs to be hooked.
 		if (!HalpHookKernelPeLoader((PVOID)ImageBase)) return FALSE;
 	}
 	

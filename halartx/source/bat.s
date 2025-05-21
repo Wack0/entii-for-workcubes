@@ -23,6 +23,11 @@ LEAF_ENTRY(HalpSetMmioDbat)
 	LWI(r.6, 0x0800002A) // phys at 0x08000000, uncached, guarded, readwrite
 	LWI(r.5, 0x8C0003FE) // base at 0x8C000000, size = 32MB, kernel mode only
 	LWI(r.4, 0x0C00002A) // phys at 0x0C000000, uncached, guarded, readwrite
+	// set invalid first just in case
+	li r.3, 0
+	mtdbatu 1, r.3
+	mtdbatu 2, r.3
+	isync
 	// set lower part first
 	mtdbatl 1, r.4
 	mtdbatl 2, r.6

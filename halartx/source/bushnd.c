@@ -13,6 +13,37 @@
 
 extern const ULONG HalpInterruptToIrql[];
 
+enum {
+	AFFINITY_CORE0 = (1 << 0),
+	AFFINITY_CORE1 = (1 << 1),
+	AFFINITY_CORE2 = (1 << 2),
+	AFFINITY_ALL = AFFINITY_CORE0 | AFFINITY_CORE1 | AFFINITY_CORE2
+};
+
+static const UCHAR HalpInterruptAffinity[] = {
+	AFFINITY_ALL, // ERROR
+	AFFINITY_ALL, // RESET
+	AFFINITY_ALL, // DVD
+	AFFINITY_ALL, // SERIAL
+	AFFINITY_ALL, // EXI (used for USB gecko thus kd)
+	AFFINITY_ALL, // AUDIO
+	AFFINITY_ALL, // DSP
+	AFFINITY_ALL, // MEM
+	AFFINITY_CORE0, // VI
+	AFFINITY_CORE0, // PE_TOKEN
+	AFFINITY_CORE0, // PE_FINISH
+	AFFINITY_CORE0, // CP_FIFO
+	AFFINITY_ALL, // DEBUG
+	AFFINITY_ALL, // HIGHSPEED_PORT (gone from RVL)
+	AFFINITY_CORE0, // VEGAS (IOS IPC)
+	AFFINITY_CORE0, // (15)
+	AFFINITY_CORE0, // (16)
+	AFFINITY_CORE0, AFFINITY_CORE1, AFFINITY_CORE2, // CP_FIFO for each core
+	AFFINITY_CORE0, AFFINITY_CORE1, AFFINITY_CORE2, // IPI
+	AFFINITY_ALL, // GPU7
+	AFFINITY_ALL, // LATTE
+};
+
 ULONG
 HalGetBusData(
 	IN BUS_DATA_TYPE  BusDataType,
@@ -107,17 +138,20 @@ HalGetInterruptVector(
 	if (BusNumber != 0) return 0;
 	
 	// Check if passed interrupt number is valid.
+	BOOLEAN IsCafe = HalpSystemIsCafe();
 	if (BusInterruptVector > VECTOR_RVL_MAX) {
-		if (RUNTIME_BLOCK[RUNTIME_SYSTEM_TYPE] == ARTX_SYSTEM_LATTE) {
+		if (IsCafe) {
 			if (BusInterruptVector > VECTOR_CAFE_MAX) return 0;
 		} else {
 			return 0;
 		}
 	}
 	
-	// TODO: MP: on Cafe interrupts can be taken on other CPUs.
-	// For now only "enhanced vWii" is supported, which uses the old PI and thus can only take interrupts on CPU 0.
-	*Affinity = 1;
+	ULONG iAffinity = 1;
+	if (IsCafe) {
+		iAffinity = HalpInterruptAffinity[BusInterruptVector];
+	}
+	*Affinity = iAffinity;
 	*Irql = HalpInterruptToIrql[BusInterruptVector];
 	
 	return DEVICE_VECTORS + BusInterruptVector;

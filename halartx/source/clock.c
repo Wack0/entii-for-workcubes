@@ -4,9 +4,7 @@
 #include "ints.h"
 
 ULONG HalpPerformanceFrequency;
-extern ULONG HalpRegisteredInterrupts;
 extern ULONG HalpIrqlToMask[];
-extern PPI_INTERRUPT_REGS HalpPiInterruptRegs;
 extern BOOLEAN KdPollBreakIn (VOID);
 
 ULONG HalpClockCount;
@@ -44,7 +42,8 @@ BOOLEAN HalpHandleDecrementerInterrupt(IN PKINTERRUPT Interrupt, PVOID ServiceCo
 	// raise IRQL manually
 	KIRQL OldIrql = PCR->CurrentIrql;
 	PCR->CurrentIrql = CLOCK2_LEVEL;
-	MmioWriteBase32(MMIO_OFFSET(HalpPiInterruptRegs, Mask), HalpIrqlToMask[CLOCK2_LEVEL] & HalpRegisteredInterrupts);
+	if (HalpSystemIsCafe()) MmioWriteBase32(MMIO_PILT_OFFSET(Mask), HalpIrqlToMask[CLOCK2_LEVEL] & HalpRegisteredInterrupts);
+	else MmioWriteBase32(MMIO_OFFSET(HalpPiInterruptRegs, Mask), HalpIrqlToMask[CLOCK2_LEVEL] & HalpRegisteredInterrupts);
 	
 	// Reset the decrememnter.
 	HalpUpdateDecrementer(HalpClockCount);
@@ -68,19 +67,17 @@ BOOLEAN HalpHandleDecrementerInterrupt(IN PKINTERRUPT Interrupt, PVOID ServiceCo
 	
 	// Re-enable interrupts.
 	PCR->CurrentIrql = OldIrql;
-	MmioWriteBase32(MMIO_OFFSET(HalpPiInterruptRegs, Mask), HalpIrqlToMask[OldIrql] & HalpRegisteredInterrupts);
+	if (HalpSystemIsCafe()) MmioWriteBase32(MMIO_PILT_OFFSET(Mask), HalpIrqlToMask[OldIrql] & HalpRegisteredInterrupts);
+	else MmioWriteBase32(MMIO_OFFSET(HalpPiInterruptRegs, Mask), HalpIrqlToMask[OldIrql] & HalpRegisteredInterrupts);
 	return TRUE;
 }
 
-// MPNOTE: not static for MP
-// not used for non-MP, we implement here anyway because it's simple enough
 // Decrement interrupt handler for other CPUs
-static BOOLEAN HalpHandleDecrementerInterrupt1(IN PKINTERRUPT Interrupt, PVOID ServiceContext, PVOID TrapFrame) {
+BOOLEAN HalpHandleDecrementerInterrupt1(IN PKINTERRUPT Interrupt, PVOID ServiceContext, PVOID TrapFrame) {
 	// raise IRQL manually
 	KIRQL OldIrql = PCR->CurrentIrql;
 	PCR->CurrentIrql = CLOCK2_LEVEL;
-	// no PI interrupts taken for this CPU
-	//MmioWrite32(&HalpPiInterruptRegs->Mask, HalpIrqlToMask[CLOCK2_LEVEL] & HalpRegisteredInterrupts);
+	if (HalpSystemIsCafe()) MmioWriteBase32(MMIO_PILT_OFFSET(Mask), HalpIrqlToMask[CLOCK2_LEVEL] & HalpRegisteredInterrupts);
 	
 	// Reset the decrememnter.
 	HalpUpdateDecrementer(HalpFullTickClockCount);
@@ -90,8 +87,7 @@ static BOOLEAN HalpHandleDecrementerInterrupt1(IN PKINTERRUPT Interrupt, PVOID S
 	
 	// Re-enable interrupts.
 	PCR->CurrentIrql = OldIrql;
-	// no PI interrupts taken for this CPU
-	//MmioWrite32(&HalpPiInterruptRegs->Mask, HalpIrqlToMask[OldIrql] & HalpRegisteredInterrupts);
+	if (HalpSystemIsCafe()) MmioWriteBase32(MMIO_PILT_OFFSET(Mask), HalpIrqlToMask[CLOCK2_LEVEL] & HalpRegisteredInterrupts);
 	return TRUE;
 }
 
