@@ -932,6 +932,7 @@ VP_STATUS ViFindAdapter(PVOID HwDeviceExtension, PVOID HwContext, PWSTR Argument
 		if (SetupddLoaded) {
 			// Also initialise the timer and DPC.
 			KeInitializeDpc(&Extension->TimerDpc, FbpTimerCallback, Extension);
+			KeSetTargetProcessorDpc(&Extension->TimerDpc, 0);
 			KeInitializeTimer(&Extension->Timer);
 		} else {
 			// Allocate and map the bank buffer. Must be used uncached here as the physical page will get mapped elsewhere as uncached.
@@ -1464,12 +1465,21 @@ VP_STATUS ViStartIoImpl(PDEVICE_EXTENSION Extension, PVIDEO_REQUEST_PACKET Reque
 }
 
 BOOLEAN ViStartIo(PVOID HwDeviceExtension, PVIDEO_REQUEST_PACKET RequestPacket) {
+	// This code must run on CPU 0.
+	KAFFINITY OldAffinity = KeSetAffinityThread(PsGetCurrentThread(), 1);
+	
 	PDEVICE_EXTENSION Extension = (PDEVICE_EXTENSION)HwDeviceExtension;
 	RequestPacket->StatusBlock->Status = ViStartIoImpl(Extension, RequestPacket);
+	
+	// Switch affinity back to what it was.
+	KeSetAffinityThread(PsGetCurrentThread(), OldAffinity);
 	return TRUE;
 }
 
 NTSTATUS DriverEntry(PVOID DriverObject, PVOID RegistryPath) {
+	// This code must run on CPU 0.
+	KAFFINITY OldAffinity = KeSetAffinityThread(PsGetCurrentThread(), 1);
+	
 	VIDEO_HW_INITIALIZATION_DATA InitData;
 	RtlZeroMemory(&InitData, sizeof(InitData));
 	
@@ -1486,5 +1496,8 @@ NTSTATUS DriverEntry(PVOID DriverObject, PVOID RegistryPath) {
 	// Our HAL(s) configure VMEBus to be equal to Internal, nothing else uses it.
 	InitData.AdapterInterfaceType = VMEBus;
 	NTSTATUS Status = VideoPortInitialize(DriverObject, RegistryPath, &InitData, NULL);
+	
+	// Switch affinity back to what it was.
+	KeSetAffinityThread(PsGetCurrentThread(), OldAffinity);
 	return Status;
 }
