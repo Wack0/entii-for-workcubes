@@ -790,6 +790,9 @@ VP_STATUS ViFindAdapter(PVOID HwDeviceExtension, PVOID HwContext, PWSTR Argument
 	if ((ULONG)RUNTIME_BLOCK < 0x80000000) return ERROR_DEV_NOT_EXIST;
 	if ((ULONG)RUNTIME_BLOCK >= 0x90000000) return ERROR_DEV_NOT_EXIST;
 	
+	// If this is Cafe, this device is not enabled.
+	if (RUNTIME_BLOCK[RUNTIME_SYSTEM_TYPE] >= ARTX_SYSTEM_LATTE) return ERROR_DEV_NOT_EXIST;
+	
 	// Grab the framebuffer config and check that it's not NULL and sane.
 	PFRAME_BUFFER FbConfig = RUNTIME_BLOCK[RUNTIME_FRAME_BUFFER];
 	if ((ULONG)FbConfig == 0) return ERROR_DEV_NOT_EXIST;
@@ -883,7 +886,7 @@ VP_STATUS ViFindAdapter(PVOID HwDeviceExtension, PVOID HwContext, PWSTR Argument
 	{
 		KAFFINITY OldAffinity = KeSetAffinityThread(PsGetCurrentThread(), 1);
 		CppFifoEnable();
-		KeSetAffinityThread(PCR->CurrentThread, OldAffinity);
+		KeSetAffinityThread(PsGetCurrentThread(), OldAffinity);
 	}
 	
 	// If setupdd is loaded, we need to set up a framebuffer copy in main memory.
@@ -1064,6 +1067,9 @@ BOOLEAN ViInitialise(PVOID HwDeviceExtension) {
 	// Initialisation for after we get control of VI from the HAL.
 	
 	PDEVICE_EXTENSION Extension = (PDEVICE_EXTENSION)HwDeviceExtension;
+	
+	// This code must run on CPU 0.
+	KAFFINITY OldAffinity = KeSetAffinityThread(PsGetCurrentThread(), 1);
 
 	// Clear the GPU interrupt and the CP interrupt.
 	PE_FINISHED_CLEAR();
@@ -1112,6 +1118,9 @@ BOOLEAN ViInitialise(PVOID HwDeviceExtension) {
 		FbpStartTimer(Extension);
 	}
 #endif
+	
+	// Switch affinity back to what it was.
+	KeSetAffinityThread(PsGetCurrentThread(), OldAffinity);
 	return TRUE;
 }
 
