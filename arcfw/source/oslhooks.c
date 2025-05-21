@@ -61,7 +61,7 @@ typedef enum {
 
 typedef enum {
     AOT_NONE,
-    AOT_STWCX,
+    AOT_STWCX
 } INSTRUCTION_AOT_TYPE;
 
 // Define ARC boot library structures used here.
@@ -1459,18 +1459,21 @@ static ARC_STATUS hook_BlSetupForNt(PVOID LoaderParameterBlock) {
 void OslHookInit(PVOID BlOpen, PVOID BlFileTable, PVOID BlSetupForNt, PVOID BlReadSignature) {
     (void)BlReadSignature;
 
-    // On Espresso, hook BlOpen and get BlFileTable, to hook the PE loader in osloader/setupldr
+    // On Espresso+Latte, hook BlOpen and get BlFileTable, to hook the PE loader in osloader/setupldr
     // This is so all boot-time loaded PEs get patched:
     // stwcx rS,rA,rB to dcbst rA,rB ; stwcx rS,rA,rB - patching in a branch to a code cave (one created by extra PE section) as required.
     // This is to work around a hardware erratum on multiprocessor Espresso.
     // When NT is booted, the HAL can hook the kernel's PE loader to do the same thing.
+    
+    // On wiimode Espresso, the multicore coherency hardware gets disabled by the bootrom (and reverting that register change causes PPC to hang),
+    // so only a single core can run in that scenario. (2 cores very unstable - hang in text setup - 3 cores even more unstable - hang when initialising text setup)
     ULONG Pvr;
     __asm__ __volatile__("mfpvr %0" : "=r"(Pvr));
     Pvr >>= 16;
 #if 0 // debugging on non-espresso
     Pvr = 0x7001;
 #endif
-    if (Pvr == 0x7001) {
+    if (Pvr == 0x7001 && s_RuntimePointers[RUNTIME_SYSTEM_TYPE].v == ARTX_SYSTEM_LATTE) {
         orig_BlOpen = (PBL_OPEN_ROUTINE)BlOpen;
         s_BlFileTable = (PBL_FILE_TABLE)BlFileTable;
         if (ScratchAddress == NULL) ScratchAddress = ArcLoadGetScratchAddress();
