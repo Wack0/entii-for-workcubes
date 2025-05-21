@@ -182,9 +182,9 @@ BOOLEAN HalpFixLowMem(PLOADER_PARAMETER_BLOCK LoaderBlock) {
 		if (ExhIndex == 0 && ExhOffset > 0x300) ExhIndex++;
 	}
 	
-	// Is this an Espresso CPU, in Cafe mode?
+	// Is this an Espresso CPU?
 	BOOLEAN IsMultiprocessorEspresso = FALSE;
-	if (HalpCpuIsEspresso()) { //if (HalpSystemIsCafe()) {
+	if (HalpCpuIsEspresso()) {
 		// Is this a multiprocessor kernel?
 		// In this case, some instructions were placed in a code cave at real0.
 		// Otherwise, real0+8 is zero.

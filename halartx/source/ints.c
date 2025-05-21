@@ -231,8 +231,9 @@ BOOLEAN HalpHandleExternalInterrupt(
 	IN PVOID TrapFrame
 ) {
 	// Check if this is really an IPI.
+	ULONG CoreId = 0;
 	if (HalpCpuIsEspresso()) {
-		ULONG CoreId = __mfspr(SPR_PIR);
+		CoreId = __mfspr(SPR_PIR);
 		// HACK: for CPU not 0, if phase is nonzero and BATs aren't set then do it
 		if (CoreId != 0 && HalpInitPhase != 0 && !HALPCR->SetBat) {
 			HALPCR->SetBat = 1;
@@ -306,7 +307,7 @@ BOOLEAN HalpHandleExternalInterrupt(
 	BOOLEAN IntRegistered = (HalpRegisteredInterrupts & CurrentMask) != 0;
 	if (IntRegistered) HalpRegisteredInterrupts &= ~CurrentMask;
 	if (IsCafe) MmioWriteBase32(MMIO_PILT_OFFSET(Mask), (HalpIrqlToMask[Irql] & HalpRegisteredInterrupts));
-	else MmioWriteBase32(MMIO_OFFSET(HalpPiInterruptRegs, Mask), (HalpIrqlToMask[Irql] & HalpRegisteredInterrupts));
+	else if (CoreId == 0) MmioWriteBase32(MMIO_OFFSET(HalpPiInterruptRegs, Mask), (HalpIrqlToMask[Irql] & HalpRegisteredInterrupts));
 	
 	// Acknowledge the handled interrupt, if it's possible to do so here
 	// Only interrupt 0-1,12,13 can be acked here,
@@ -314,7 +315,7 @@ BOOLEAN HalpHandleExternalInterrupt(
 	// and allows all interrupts to be acked here.
 	// TODO: what interrupts are allowed to be acked here on latte?
 	if (IsCafe) MmioWriteBase32(MMIO_PILT_OFFSET(Cause), CurrentMask);
-	else MmioWriteBase32(MMIO_OFFSET(HalpPiInterruptRegs, Cause), CurrentMask);
+	else if (CoreId == 0) MmioWriteBase32(MMIO_OFFSET(HalpPiInterruptRegs, Cause), CurrentMask);
 	
 	// If the new IRQL level is lower than CLOCK2,
 	// allow decrementer interrupts by reenabling interrupts.
@@ -356,7 +357,7 @@ BOOLEAN HalpHandleExternalInterrupt(
 	// Lower the IRQL
 	PCR->CurrentIrql = OldIrql;
 	if (IsCafe) MmioWriteBase32(MMIO_PILT_OFFSET(Mask), Mask);
-	else MmioWriteBase32(MMIO_OFFSET(HalpPiInterruptRegs, Mask), Mask);
+	else if (CoreId == 0) MmioWriteBase32(MMIO_OFFSET(HalpPiInterruptRegs, Mask), Mask);
 	return ret;
 }
 

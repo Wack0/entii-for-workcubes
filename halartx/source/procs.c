@@ -50,6 +50,8 @@ static void sync_before_exec(const void* p, ULONG len)
 BOOLEAN HalStartNextProcessor(IN PLOADER_PARAMETER_BLOCK LoaderBlock, IN PKPROCESSOR_STATE ProcessorState) {
 	if (HalpSystemIsUniprocessor()) return FALSE;
 	if (s_LastProcessorStarted == 2) return FALSE;
+	BOOLEAN IsCafe = HalpSystemIsCafe();
+	if (!IsCafe && s_LastProcessorStarted == 1) return FALSE;
 	
 	// Violate the license agreement. (NT Workstation only allows 2 CPUs)
 	// KeRegisteredProcessors located 4 bytes after exported KeNumberProcessors, this is true in all of PPC NT
@@ -89,8 +91,6 @@ BOOLEAN HalStartNextProcessor(IN PLOADER_PARAMETER_BLOCK LoaderBlock, IN PKPROCE
 		0x4c000064, // rfi
 	};
 	_Static_assert(sizeof(s_BootCode) <= sizeof(HalpExiRegs->BootVector));
-	
-	BOOLEAN IsCafe = HalpSystemIsCafe();
 	
 	// Make sure the cache is flushed for KeStartProcessor.
 	sync_before_exec((PVOID)ProcessorState->ContextFrame.Iar, 0x100);
@@ -134,7 +134,7 @@ BOOLEAN HalStartNextProcessor(IN PLOADER_PARAMETER_BLOCK LoaderBlock, IN PKPROCE
 		sync_before_exec(BootVector, 0x40);
 		KePhase0DeleteIoMap(0x08100100, 0x40);
 	} else {
-		// Wiimode - should never happen, because some coherency gets broken, but leave it just in case fixing that is ever figured out.
+		// Wiimode
 		// Copy to the EXI boot vector.
 		EXI_WRITE_BOOT_VECTOR(0);
 		EXI_WRITE_BOOT_VECTOR(1);
@@ -188,6 +188,9 @@ BOOLEAN HalStartNextProcessor(IN PLOADER_PARAMETER_BLOCK LoaderBlock, IN PKPROCE
 	}
 	
 	if (MmioReadBase32(HalpPxiRegisters, 0x24) == 0) {
+		char Buffer[128];
+		_snprintf(Buffer, sizeof(Buffer), "HAL: Failed to start CPU %d\n", NextCore);
+		HalDisplayString(Buffer);
 		return FALSE;
 	}
 	MmioWriteBase32(HalpPxiRegisters, 0x24, 0);
@@ -202,6 +205,7 @@ BOOLEAN HalStartNextProcessor(IN PLOADER_PARAMETER_BLOCK LoaderBlock, IN PKPROCE
 // Determine if all processors are started.
 BOOLEAN HalAllProcessorsStarted(void) {
 	if (HalpSystemIsUniprocessor()) return TRUE;
+	if (!HalpSystemIsCafe()) return (s_LastProcessorStarted == 1); // only use 2 cores in wiimode
 	return (s_LastProcessorStarted == 2); // core2 is last.
 }
 

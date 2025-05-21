@@ -25,7 +25,7 @@ static const UCHAR HalpInterruptAffinity[] = {
 	AFFINITY_ALL, // RESET
 	AFFINITY_ALL, // DVD
 	AFFINITY_ALL, // SERIAL
-	AFFINITY_ALL, // EXI (used for USB gecko thus kd)
+	AFFINITY_CORE0, // EXI (used for USB gecko thus kd)
 	AFFINITY_ALL, // AUDIO
 	AFFINITY_ALL, // DSP
 	AFFINITY_ALL, // MEM

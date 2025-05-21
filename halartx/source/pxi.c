@@ -554,12 +554,8 @@ static NTSTATUS HalpPxiNewRequest(IOS_OPERATION Op, IOS_HANDLE Handle, PVOID Sta
 }
 
 static NTSTATUS HalpPxiWaitForRequest(PIOS_IPC_SYNC Sync) {
-	// Ensure thread is executing on CPU 0.
-	//KAFFINITY OldAffinity = KeSetAffinityThread(PCR->CurrentThread, 1);
 	// Wait for the request to complete.
 	KeWaitForSingleObject( &Sync->Event, Executive, KernelMode, FALSE, NULL );
-	// Revert previous affinity.
-	//KeSetAffinityThread(PCR->CurrentThread, OldAffinity);
 	// Return the status code.
 	return Sync->Status;
 }
