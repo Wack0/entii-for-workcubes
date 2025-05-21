@@ -556,7 +556,8 @@ static ARC_STATUS FindLengthOfCodeTable(ULONG FileId, PIMAGE_SECTION_HEADER Sect
 
         // Walk through all instructions, looking for stwcx instructions.
         PU32LE Instruction = (PU32LE)CodeScratch;
-        for (ULONG i = 0; i < Sections[Section].SizeOfRawData / sizeof(ULONG); i++) {
+        ULONG CountInstructions = Sections[Section].SizeOfRawData / sizeof(ULONG);
+        for (ULONG i = 0; i < CountInstructions; i++) {
             ULONG RealIndex = i;
             ULONG AotLength = InstructionNeedsAot(Instruction[RealIndex].v, &AotType);
             if (AotLength != 0) {
@@ -740,8 +741,9 @@ static ARC_STATUS PePatch_Relocate(PPE_PATCH_ENTRY Patch) {
                     ULONG additionalLen = ptrStart - additionalStart;
                     PULONG additionalLittle = (PULONG)additionalStart;
                     ULONG additionalOffset = TableSectionStart - additionalStart;
+                    ULONG additionalCount = additionalLen / sizeof(ULONG);
 
-                    for (ULONG off = 0; off < additionalLen / sizeof(ULONG); off++, additionalOffset -= sizeof(ULONG)) {
+                    for (ULONG off = 0; off < additionalCount; off++, additionalOffset -= sizeof(ULONG)) {
                         if (additionalOffset > INT32_MAX) {
                             // ???
                             return 10100;
@@ -768,7 +770,8 @@ static ARC_STATUS PePatch_Relocate(PPE_PATCH_ENTRY Patch) {
                 }
             }
 
-            for (ULONG off = 0; off < funcLen / sizeof(ULONG); off++, TableOffsetFromInstruction -= sizeof(ULONG)) {
+            ULONG funcCount = funcLen / sizeof(ULONG);
+            for (ULONG off = 0; off < funcCount; off++, TableOffsetFromInstruction -= sizeof(ULONG)) {
                 if (TableOffsetFromInstruction > INT32_MAX) {
                     // ???
                     return 10102;
@@ -795,6 +798,12 @@ static ARC_STATUS PePatch_Relocate(PPE_PATCH_ENTRY Patch) {
 
 
         if (s_IsLoadingNtKernel) {
+            // Copy 0x500 (external interrupt handler) to 0x1700 (espresso IPI handler)
+            // Most older multiprocessor powerpc systems handle IPIs as an external interrupt.
+            // Therefore, let's do the same.
+            memcpy((PVOID)((ULONG)s_NtKernelReal0 + 0x1700), (PVOID)((ULONG)s_NtKernelReal0 + 0x500), 0x100);
+
+
             // Deal with stwcx instructions in real0
             for (ULONG addr = (ULONG)s_NtKernelReal0; addr < (ULONG)s_NtKernelReal0End; addr += 4) {
                 PPPC_INSTRUCTION insn = (PPPC_INSTRUCTION)addr;
@@ -1450,19 +1459,18 @@ static ARC_STATUS hook_BlSetupForNt(PVOID LoaderParameterBlock) {
 void OslHookInit(PVOID BlOpen, PVOID BlFileTable, PVOID BlSetupForNt, PVOID BlReadSignature) {
     (void)BlReadSignature;
 
-    // On Espresso+Latte, hook BlOpen and get BlFileTable, to hook the PE loader in osloader/setupldr
+    // On Espresso, hook BlOpen and get BlFileTable, to hook the PE loader in osloader/setupldr
     // This is so all boot-time loaded PEs get patched:
     // stwcx rS,rA,rB to dcbst rA,rB ; stwcx rS,rA,rB - patching in a branch to a code cave (one created by extra PE section) as required.
     // This is to work around a hardware erratum on multiprocessor Espresso.
     // When NT is booted, the HAL can hook the kernel's PE loader to do the same thing.
-    // Cache coherency is broken on wiimode Espresso, so only a single core can run in that scenario.
     ULONG Pvr;
     __asm__ __volatile__("mfpvr %0" : "=r"(Pvr));
     Pvr >>= 16;
 #if 0 // debugging on non-espresso
     Pvr = 0x7001;
 #endif
-    if (Pvr == 0x7001 && s_RuntimePointers[RUNTIME_SYSTEM_TYPE].v == ARTX_SYSTEM_LATTE) {
+    if (Pvr == 0x7001) {
         orig_BlOpen = (PBL_OPEN_ROUTINE)BlOpen;
         s_BlFileTable = (PBL_FILE_TABLE)BlFileTable;
         if (ScratchAddress == NULL) ScratchAddress = ArcLoadGetScratchAddress();

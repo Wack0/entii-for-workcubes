@@ -1168,6 +1168,14 @@ void ARC_NORETURN FwMain(PHW_DESCRIPTION Desc) {
 		MmioWriteBase32((PVOID)0x6C000000, 0x3004, 0); // PI_INTMASK = 0
 		MmioWriteBase32((PVOID)0x6C000000, 0x3000, 0xFFFFFFFF); // PI_INTSTATUS = 0xFFFFFFFF
 	}
+	else {
+		MmioWriteBase32((PVOID)0x6C000000, 0x7C, 0); // PI_INTMASK = 0
+		MmioWriteBase32((PVOID)0x6C000000, 0x78, 0xFFFFFFFF); // PI_INTSTATUS = 0xFFFFFFFF
+		MmioWriteBase32((PVOID)0x6C000000, 0x84, 0); // PI_INTMASK = 0
+		MmioWriteBase32((PVOID)0x6C000000, 0x80, 0xFFFFFFFF); // PI_INTSTATUS = 0xFFFFFFFF
+		MmioWriteBase32((PVOID)0x6C000000, 0x8C, 0); // PI_INTMASK = 0
+		MmioWriteBase32((PVOID)0x6C000000, 0x88, 0xFFFFFFFF); // PI_INTSTATUS = 0xFFFFFFFF
+	}
 
 
 	// Latte uses an RGB framebuffer, not a YUV one.
@@ -1237,7 +1245,7 @@ void ARC_NORETURN FwMain(PHW_DESCRIPTION Desc) {
 	// PXI (where appropriate)
 	if (SystemType >= ARTX_SYSTEM_VEGAS) {
 		printf("Init pxi...\r\n");
-		PxiInit();
+		PxiInit(SystemType);
 		PxiHeapInit(Desc->DdrIpcBase, Desc->DdrIpcLength);
 		printf("Init sdmc...\r\n");
 		SdmcStartup();
@@ -1292,7 +1300,7 @@ void ARC_NORETURN FwMain(PHW_DESCRIPTION Desc) {
 
 	// GX FIFO buffer.
 	s_RuntimeGx.PointerArc = Desc->GxFifoBase;
-	s_RuntimeGx.Length = 0x10000;
+	s_RuntimeGx.Length = Desc->FrameBufferBase - Desc->GxFifoBase;
 	s_RuntimePointers[RUNTIME_GX_FIFO].v = (ULONG)&s_RuntimeGx;
 
 	// System type.

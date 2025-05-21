@@ -1011,7 +1011,8 @@ void PxiInit(ARTX_SYSTEM_TYPE SystemType) {
 		PxiResFinished();
 
 		// Wait a while for IOS to fully init.
-		udelay(1000000);
+		// Don't do this - most processes are running by this point and USBv5 init busyloops anyway.
+		//udelay(1000000);
 	}
 
 	// Cleanup any existing IPC transactions
