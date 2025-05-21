@@ -20,6 +20,7 @@
 #define _NTOSDEF_ 1 // we want internal video.h, because we basically are
 #include <video.h>
 #include <winerror.h>
+#define KIPCR 0xffffd000
 
 extern ULONG NtBuildNumber;
 
@@ -878,7 +879,12 @@ VP_STATUS ViFindAdapter(PVOID HwDeviceExtension, PVOID HwContext, PWSTR Argument
 	ConfigInfo->BusInterruptLevel = 1;
 	
 	// Enable the command processor FIFO.
-	CppFifoEnable();
+	// This must be done on CPU 0.
+	{
+		KAFFINITY OldAffinity = KeSetAffinityThread(PsGetCurrentThread(), 1);
+		CppFifoEnable();
+		KeSetAffinityThread(PCR->CurrentThread, OldAffinity);
+	}
 	
 	// If setupdd is loaded, we need to set up a framebuffer copy in main memory.
 	// We'll use only 640x480x32 for this.
