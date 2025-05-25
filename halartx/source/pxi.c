@@ -41,7 +41,8 @@ static LONG s_NumberOfRequestsToAck = 0;
 static KDPC
 	s_DpcRequestAck[IPC_REQUEST_COUNT],
 	s_DpcResponseSent[IPC_REQUEST_COUNT];
-	
+
+#if 0
 static KIRQL PxipAcquireSpinLock(PKSPIN_LOCK SpinLock) {
 	KIRQL CurrentIrql = KeGetCurrentIrql();
 	if (CurrentIrql < DISPATCH_LEVEL) KeRaiseIrql(DISPATCH_LEVEL, &CurrentIrql);
@@ -53,6 +54,10 @@ static void PxipReleaseSpinLock(PKSPIN_LOCK SpinLock, KIRQL OldIrql) {
 	KiReleaseSpinLock(SpinLock);
 	if (OldIrql < DISPATCH_LEVEL) KeLowerIrql(OldIrql);
 }
+#endif
+
+#define PxipAcquireSpinLock(SpinLock) KeAcquireSpinLockRaiseToDpc((SpinLock))
+#define PxipReleaseSpinLock(SpinLock, OldIrql) KeReleaseSpinLock((SpinLock), (OldIrql))
 
 static void HalpPxiAddRequest(PIOS_IPC_REQUEST_ENTRY Entry) {
 	KIRQL OldIrql = PxipAcquireSpinLock(&s_IpcRequestPendingSpinLock);

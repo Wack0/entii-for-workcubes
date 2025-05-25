@@ -121,9 +121,6 @@ BOOLEAN HalpFixLowMem(PLOADER_PARAMETER_BLOCK LoaderBlock) {
 		Length += sizeof(ULONG);
 	}
 	
-	// Copy from low memory to real0.
-	memcpy(Real0, (void*)0x80000000, Length + 0x3010);
-	
 	memcpy(&Real0[0x2000], &Real0[0x3010], Length);
 	// Relocate any backwards branches in this range.
 	{

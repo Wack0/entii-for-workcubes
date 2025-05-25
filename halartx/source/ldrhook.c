@@ -79,9 +79,6 @@ typedef struct _PE_PATCH_ENTRY_NT {
     ULONG SizeOfMap; // Mapped image size for when patching is deferred.
 } PE_PATCH_ENTRY_NT, *PPE_PATCH_ENTRY_NT;
 
-static PPE_PATCH_ENTRY_NT s_NtPatchFirst = NULL, s_NtPatchLast = NULL;
-static PPE_PATCH_ENTRY_FILE_NT s_NtFilePatchFirst = NULL, s_NtFilePatchLast = NULL;
-
 static inline BOOLEAN is_offset_in_branch_range(long offset)
 {
 	return (offset >= -0x2000000 && offset <= 0x1fffffc && !(offset & 0x3));
@@ -394,6 +391,27 @@ static ULONG PePatch_Relocate(PPE_PATCH_ENTRY Patch, PRTL_BITMAP PatchedPages) {
 // Hook implementations.
 
 typedef NTSTATUS
+(*tfpObCreateObject)(
+	IN KPROCESSOR_MODE AttributesMode,
+	IN POBJECT_TYPE ObjectType,
+	IN POBJECT_ATTRIBUTES ObjectAttributes,
+	IN KPROCESSOR_MODE AccessMode,
+	IN PVOID Reserved,
+	IN ULONG ObjectSize,
+	IN ULONG PagedPoolCharge,
+	IN ULONG NonPagedPoolCharge,
+	OUT PVOID* Object
+);
+
+typedef NTSTATUS
+(*tfpObReferenceObjectByPointer)(
+	PVOID Object,
+	ACCESS_MASK DesiredAccess,
+	POBJECT_TYPE ObjectType,
+	KPROCESSOR_MODE AccessMode
+);
+
+typedef NTSTATUS
 (*tfpMmCreateSection)(
 	OUT PVOID *SectionObject,
 	IN ULONG DesiredAccess,
@@ -403,6 +421,13 @@ typedef NTSTATUS
 	IN ULONG AllocationAttributes,
 	IN PVOID FileHandle OPTIONAL,
 	IN PVOID FileObject OPTIONAL
+);
+
+typedef NTSTATUS
+(*tfpMmMapViewInSystemSpace)(
+	IN PVOID Section,
+	OUT PVOID* MappedBase,
+	IN OUT PULONG ViewSize
 );
 
 typedef void (*tfpMiSectionDelete)(PVOID Object);
@@ -419,45 +444,60 @@ typedef NTSTATUS
 
 typedef NTSTATUS (*tfpFsRtlGetFileSize)(PVOID FileObject, PLARGE_INTEGER FileSize);
 
+typedef PVOID (*tfpMmPageEntireDriver)(PVOID AddrInSection);
+
+typedef ULONG (*tfpRtlVirtualUnwind)(
+	ULONG ControlPc,
+	PRUNTIME_FUNCTION_ENTRY FunctionEntry,
+	PCONTEXT ContextRecord,
+	PBOOLEAN InFunction,
+	PULONG EstablisherFrame,
+	PVOID ContextPointers,
+	ULONG LowStackLimit,
+	ULONG HighStackLimit
+);
+
+typedef PVOID (*tfpRtlPcToFileHeader)(ULONG Address, PVOID BaseAddress);
+
 #define DEFINE_ORIG(name) static AIXCALL_FPTR fporig_##name; static tfp##name orig_##name = (tfp##name)&fporig_##name
+DEFINE_ORIG(ObCreateObject);
+//DEFINE_ORIG(ObReferenceObjectByPointer);
 DEFINE_ORIG(MmCreateSection);
+DEFINE_ORIG(MmMapViewInSystemSpace);
 DEFINE_ORIG(MiSectionDelete);
 DEFINE_ORIG(IopDeleteFile);
 DEFINE_ORIG(IoPageRead);
 DEFINE_ORIG(FsRtlGetFileSize);
+DEFINE_ORIG(MmPageEntireDriver);
+DEFINE_ORIG(RtlVirtualUnwind);
 
-#define orig_MmMapViewInSystemSpace MmMapViewInSystemSpace
+static AIXCALL_FPTR fp_RtlPcToFileHeader;
+static tfpRtlPcToFileHeader RtlPcToFileHeader = (tfpRtlPcToFileHeader)&fp_RtlPcToFileHeader;
+
+enum {
+	// file_object has a size element, but the structure size never changed until NT6x
+	FILE_OFFSET_OF_ADDED = 0x70,
+	// section object doesn't store size
+	// but SECTION struct has always been 0x28 for 32-bit architectures
+	// and this is the same for powerpc
+	SECTION_OFFSET_OF_ADDED = 0x28,
+};
+
+#define PATCH_ENTRY_FILE(FileObject) *(PPE_PATCH_ENTRY_FILE_NT*)((ULONG)(FileObject) + FILE_OFFSET_OF_ADDED)
+#define PATCH_ENTRY_SECTION(SectionObject) *(PPE_PATCH_ENTRY_NT*)((ULONG)(SectionObject) + SECTION_OFFSET_OF_ADDED)
 
 
-static void NtPe_DeletePatchEntry(PPE_PATCH_ENTRY_NT PatchEntry, PPE_PATCH_ENTRY_NT Appended) {
-    if (Appended != NULL) {
-        Appended->Next = PatchEntry->Next;
-        if (s_NtPatchLast == PatchEntry) s_NtPatchLast = Appended;
-    }
-    else if (s_NtPatchLast == PatchEntry) {
-        s_NtPatchFirst = s_NtPatchLast = NULL;
-    }
-    else if (s_NtPatchFirst == PatchEntry) {
-        s_NtPatchFirst = PatchEntry->Next;
-        if (s_NtPatchFirst == NULL) s_NtPatchLast = NULL;
-    }
-
+static void NtPe_DeletePatchEntry(PPE_PATCH_ENTRY_NT PatchEntry) {
+	PVOID SectionObject = PatchEntry->SectionObject;
+	if (SectionObject != NULL) PATCH_ENTRY_SECTION(SectionObject) = NULL;
+	
     // Free the patch entry.
     ExFreePool(PatchEntry);
 }
 
-static void NtPe_DeleteFilePatchEntry(PPE_PATCH_ENTRY_FILE_NT PatchEntry, PPE_PATCH_ENTRY_FILE_NT Appended) {
-    if (Appended != NULL) {
-        Appended->Next = PatchEntry->Next;
-        if (s_NtFilePatchLast == PatchEntry) s_NtFilePatchLast = Appended;
-    }
-    else if (s_NtFilePatchLast == PatchEntry) {
-        s_NtFilePatchFirst = s_NtFilePatchLast = NULL;
-    }
-    else if (s_NtFilePatchFirst == PatchEntry) {
-        s_NtFilePatchFirst = PatchEntry->Next;
-        if (s_NtFilePatchFirst == NULL) s_NtFilePatchLast = NULL;
-    }
+static void NtPe_DeleteFilePatchEntry(PPE_PATCH_ENTRY_FILE_NT PatchEntry) {
+	PVOID FileObject = PatchEntry->FileObject;
+	if (FileObject != NULL) PATCH_ENTRY_FILE(FileObject) = NULL;
 
     // Free the patched sections memory if it's allocated.
     if (PatchEntry->PatchedSections != NULL) {
@@ -495,6 +535,48 @@ static PMDL MdlTryAllocate(PVOID Base, ULONG Length) {
     return Mdl;
 }
 
+extern POBJECT_TYPE *MmSectionObjectType;
+
+NTSTATUS
+hook_ObCreateObject(
+	IN KPROCESSOR_MODE AttributesMode,
+	IN POBJECT_TYPE ObjectType,
+	IN POBJECT_ATTRIBUTES ObjectAttributes,
+	IN KPROCESSOR_MODE AccessMode,
+	IN PVOID Reserved,
+	IN ULONG ObjectSize,
+	IN ULONG PagedPoolCharge,
+	IN ULONG NonPagedPoolCharge
+) {
+	// Hook code can only deal with up to 8 args, and buys stack space. So args past the eighth need to be grabbed from the hook caller's frame.
+	// Arg 9 is at offset 0x38, and so on.
+	PVOID* Object = *(PVOID**)((ULONG)__builtin_frame_address(2) + 0x38);
+	if (*IoFileObjectType != NULL && ObjectType == *IoFileObjectType) {
+		if (ObjectSize != FILE_OFFSET_OF_ADDED) return STATUS_UNSUCCESSFUL;
+		ObjectSize += 4;
+		if (PagedPoolCharge == FILE_OFFSET_OF_ADDED) PagedPoolCharge += 4;
+		if (NonPagedPoolCharge == FILE_OFFSET_OF_ADDED) NonPagedPoolCharge += 4;
+		NTSTATUS Status = orig_ObCreateObject(AttributesMode, ObjectType, ObjectAttributes, AccessMode, Reserved, ObjectSize, PagedPoolCharge, NonPagedPoolCharge, Object);
+		if (!NT_SUCCESS(Status)) return Status;
+		ULONG FileObject = (ULONG)*Object;
+		PATCH_ENTRY_FILE(FileObject) = NULL;
+		return Status;
+	}
+	
+	if (*MmSectionObjectType != NULL && ObjectType == *MmSectionObjectType) {
+		if (ObjectSize != SECTION_OFFSET_OF_ADDED) return STATUS_UNSUCCESSFUL;
+		ObjectSize += 4;
+		PagedPoolCharge += 4;
+		NTSTATUS Status = orig_ObCreateObject(AttributesMode, ObjectType, ObjectAttributes, AccessMode, Reserved, ObjectSize, PagedPoolCharge, NonPagedPoolCharge, Object);
+		if (!NT_SUCCESS(Status)) return Status;
+		ULONG SectionObject = (ULONG)*Object;
+		PATCH_ENTRY_SECTION(SectionObject) = NULL;
+		return Status;
+	}
+	
+	return orig_ObCreateObject(AttributesMode, ObjectType, ObjectAttributes, AccessMode, Reserved, ObjectSize, PagedPoolCharge, NonPagedPoolCharge, Object);
+}
+
 NTSTATUS
 hook_MmCreateSection(
 	OUT PVOID *SectionObject,
@@ -528,12 +610,7 @@ hook_MmCreateSection(
 
 	// Check for an existing file list entry.
 	BOOLEAN CreatedNewFile = FALSE;
-	PPE_PATCH_ENTRY_FILE_NT FileEntry = NULL;
-	PPE_PATCH_ENTRY_FILE_NT AppendedFile = NULL;
-	for (FileEntry = s_NtFilePatchFirst; FileEntry != NULL; FileEntry = FileEntry->Next) {
-		// Only one file list entry will ever exist for a file.
-		if (FileEntry->FileObject == File) break;
-	}
+	PPE_PATCH_ENTRY_FILE_NT FileEntry = PATCH_ENTRY_FILE(File);
 
 	if (FileEntry == NULL) {
 		// No file list entry exists, so create one.
@@ -548,15 +625,7 @@ hook_MmCreateSection(
 		memset(FileEntry, 0, sizeof(*FileEntry));
 		FileEntry->FileObject = File;
 
-		// Append it to the end of the list.
-		if (s_NtFilePatchLast == NULL) {
-			s_NtFilePatchFirst = s_NtFilePatchLast = FileEntry;
-		}
-		else {
-			AppendedFile = s_NtFilePatchLast;
-			AppendedFile->Next = FileEntry;
-			s_NtFilePatchLast = FileEntry;
-		}
+		PATCH_ENTRY_FILE(File) = FileEntry;
 	}
 
 	// Allocate memory for a patch list entry.
@@ -568,17 +637,6 @@ hook_MmCreateSection(
 	memset(PatchEntry, 0, sizeof(*PatchEntry));
 	PatchEntry->FileObject = File;
 	PatchEntry->PatchFile = FileEntry;
-
-	// Append it to the end of the list.
-	PPE_PATCH_ENTRY_NT Appended = NULL;
-	if (s_NtPatchLast == NULL) {
-		s_NtPatchFirst = s_NtPatchLast = PatchEntry;
-	}
-	else {
-		Appended = s_NtPatchLast;
-		Appended->Next = PatchEntry;
-		s_NtPatchLast = PatchEntry;
-	}
 
 	do {
 		// The patch entry has been added to the list.
@@ -596,6 +654,7 @@ hook_MmCreateSection(
 		// At this point, section object has been created, and the PE header has been modified.
 		// Set up the section object in the patch entry.
 		PatchEntry->SectionObject = Section;
+		PATCH_ENTRY_SECTION(Section) = PatchEntry;
 		// And write it to the caller's pointer.
 		*SectionObject = Section;
 
@@ -605,9 +664,9 @@ hook_MmCreateSection(
 	} while (0);
 
 	// Remove and free the patch entry.
-	NtPe_DeletePatchEntry(PatchEntry, Appended);
+	NtPe_DeletePatchEntry(PatchEntry);
 	// If the file patch entry was created by us, it's useless, so get rid of it.
-	if (CreatedNewFile) NtPe_DeleteFilePatchEntry(FileEntry, AppendedFile);
+	if (CreatedNewFile) NtPe_DeleteFilePatchEntry(FileEntry);
 	// Return status.
 	return Status;
 }
@@ -615,65 +674,42 @@ hook_MmCreateSection(
 void hook_MiSectionDelete(PVOID Object) {
 	//USE_NT_VOLATILE_REGISTERS();
 	// Deleting a section object.
+	
+	// Get the patch entry object
+	PPE_PATCH_ENTRY_NT PatchEntry = PATCH_ENTRY_SECTION(Object);
+	
+	if (PatchEntry != NULL) {
+		// Remove and free the patch entry.
+		NtPe_DeletePatchEntry(PatchEntry);
+	}
+	
 	// Call the original function.
-
 	orig_MiSectionDelete(Object);
-
-	// Search the patch entry list, looking for the one with the passed in section.
-	PPE_PATCH_ENTRY_NT Appended = NULL;
-	PPE_PATCH_ENTRY_NT PatchEntry = NULL;
-
-	for (PatchEntry = s_NtPatchFirst; PatchEntry != NULL; Appended = PatchEntry, PatchEntry = PatchEntry->Next) {
-		if (PatchEntry->SectionObject == Object) {
-			break;
-		}
-	}
-
-	if (PatchEntry == NULL) {
-		return;
-	}
-
-	// Remove and free the patch entry.
-	NtPe_DeletePatchEntry(PatchEntry, Appended);
 }
 
 void hook_IopDeleteFile(PVOID Object) {
 	// Deleting a file object.
-	// Call the original function.
-
-	orig_IopDeleteFile(Object);
-
-	// Search the file patch entry list, looking for the one with the passed in file.
-	PPE_PATCH_ENTRY_FILE_NT Appended = NULL;
-	PPE_PATCH_ENTRY_FILE_NT PatchEntry = NULL;
-
-	for (PatchEntry = s_NtFilePatchFirst; PatchEntry != NULL; Appended = PatchEntry, PatchEntry = PatchEntry->Next) {
-		if (PatchEntry->FileObject == Object) {
-			break;
-		}
+	
+	// Get the patch entry object.
+	PPE_PATCH_ENTRY_FILE_NT PatchEntry = PATCH_ENTRY_FILE(Object);
+	
+	if (PatchEntry != NULL) {
+		// Remove and free the file patch entry.
+		NtPe_DeleteFilePatchEntry(PatchEntry);
 	}
-
-	if (PatchEntry == NULL) return;
-
-	// Remove and free the file patch entry.
-	NtPe_DeleteFilePatchEntry(PatchEntry, Appended);
+	
+	// Call the original function.
+	orig_IopDeleteFile(Object);
 }
 
-#if 1 // do we actually need this?
 NTSTATUS
 hook_MmMapViewInSystemSpace(
 	IN PVOID Section,
 	OUT PVOID* MappedBase,
 	IN OUT PULONG ViewSize
 ) { 
-	// Search the patch entry list, looking for the one with the passed in section.
-	PPE_PATCH_ENTRY_NT PatchEntry = NULL;
-
-	for (PatchEntry = s_NtPatchFirst; PatchEntry != NULL; PatchEntry = PatchEntry->Next) {
-		if (PatchEntry->SectionObject == Section) {
-			break;
-		}
-	}
+	// Get the patch entry.
+	PPE_PATCH_ENTRY_NT PatchEntry = PATCH_ENTRY_SECTION(Section);
 
 	if (PatchEntry == NULL) {
 		// Could not find the entry in the list. Just call the original function.
@@ -685,7 +721,6 @@ hook_MmMapViewInSystemSpace(
 	// Returning an error here will cause a fallback to the other codepath.
 	return STATUS_UNSUCCESSFUL;
 }
-#endif
 
 NTSTATUS
 hook_IoPageRead(
@@ -697,23 +732,12 @@ hook_IoPageRead(
 ) {
 	// Reading some pages from the file.
 	
-	// Search the patch entry list, looking for the one with the passed in section.
-	PPE_PATCH_ENTRY_FILE_NT PatchEntry = NULL;
+	// Get the patch entry.
+	PPE_PATCH_ENTRY_FILE_NT PatchEntry = PATCH_ENTRY_FILE(FileObject);
 
-	for (PatchEntry = s_NtFilePatchFirst; PatchEntry != NULL; PatchEntry = PatchEntry->Next) {
-		if (
-			// File object matches.
-			PatchEntry->FileObject == FileObject &&
-			// Patches were needed.
-			PatchEntry->BaseSectionObject != NULL
-		) {
-			break;
-		}
-	}
-
-	// If a patch entry was not found, call the original function.
+	// If a patch entry was not present, call the original function.
 	// Do the same if there is to be no added section, that is, no patches whatsoever.
-	if (PatchEntry == NULL) {
+	if (PatchEntry == NULL || PatchEntry->BaseSectionObject == NULL) {
 		return orig_IoPageRead(FileObject, MemoryDescriptorList, StartingOffset, Event, IoStatusBlock);
 	}
 	ULONG OffsetStart = StartingOffset->LowPart;
@@ -1102,25 +1126,20 @@ NTSTATUS hook_FsRtlGetFileSize(PVOID FileObject, PLARGE_INTEGER FileSize) {
 	// Getting the file size. Need to increase the file size for MiCreateImageFileMap.
 	// Also save off various file offsets to be used later.
 
-	// Search the patch entry list, looking for the one with the passed in section.
-	PPE_PATCH_ENTRY_FILE_NT PatchEntry = NULL;
-
-	for (PatchEntry = s_NtFilePatchFirst; PatchEntry != NULL; PatchEntry = PatchEntry->Next) {
-		// File object matches
-		if (PatchEntry->FileObject != FileObject) continue;
-
+	// Get the patch entry.
+	PPE_PATCH_ENTRY_FILE_NT PatchEntry = PATCH_ENTRY_FILE(FileObject);
+	if (PatchEntry != NULL) {
+		// File object exists.
 		// If there's already a created section object, then we've already performed the operation.
 		if (PatchEntry->BaseSectionObject != NULL) {
 			PatchEntry = NULL;
 		}
-
-		break;
 	}
 
 	// Call the original function.
 	ULONG Status = orig_FsRtlGetFileSize(FileObject, FileSize);
 
-	// If a patch entry was not found, return.
+	// If a patch entry was not present or this function already ran once, return.
 	if (PatchEntry == NULL) return Status;
 
 	// If original function failed, return.
@@ -1769,6 +1788,7 @@ NTSTATUS hook_FsRtlGetFileSize(PVOID FileObject, PLARGE_INTEGER FileSize) {
 		PIMAGE_SECTION_HEADER CurrentSection = NULL;
 		for (ULONG Page = 0; Page < PageCount; Page++) {
 			if (!RtlCheckBit(&PatchedPages, Page)) continue;
+			if (PatchEntry->InjectedSectionStart != 0 && (Page * PAGE_SIZE) >= PatchEntry->InjectedSectionStart) continue;
 			
 			// Find the section containing this page.
 			ULONG PageOffset = Page * PAGE_SIZE;
@@ -1824,6 +1844,52 @@ NTSTATUS hook_FsRtlGetFileSize(PVOID FileObject, PLARGE_INTEGER FileSize) {
 	IoFreeMdl(Mdl);
 	ExFreePool(Kevent);
 	return Status;
+}
+
+static PVOID hook_MmPageEntireDriver(PVOID AddrInSection) {
+    // In kernel mode, injected section cannot be paged out.
+    // Therefore, disable paging out the entire driver as if it were disabled in the registry.
+	
+	// We need to return the image base.
+	PVOID ImageBase = NULL;
+	if (RtlPcToFileHeader != NULL) {
+		PVOID ImageBase = NULL;
+		RtlPcToFileHeader(AddrInSection, &ImageBase);
+	}
+	
+	if (ImageBase == NULL) {
+		// Fall back to the slow option.
+		PVOID ImageBase = orig_MmPageEntireDriver(AddrInSection);
+		MmResetDriverPaging(AddrInSection);
+	}
+	
+	return ImageBase;
+}
+
+static ULONG hook_RtlVirtualUnwind(
+	ULONG ControlPc,
+	PRUNTIME_FUNCTION_ENTRY FunctionEntry,
+	PCONTEXT ContextRecord,
+	PBOOLEAN InFunction,
+	PULONG EstablisherFrame,
+	PVOID ContextPointers,
+	ULONG LowStackLimit,
+	ULONG HighStackLimit
+) {
+	// Called at kernel exception time.
+	
+	// The function we are trying to look at may be compiled with correctly formed prologue+epilogue, or not.
+	// If it is not, RtlVirtualUnwind may hang or return ControlPc.
+	
+	ULONG Caller = orig_RtlVirtualUnwind(ControlPc, FunctionEntry, ContextRecord, InFunction, EstablisherFrame, ContextPointers, LowStackLimit, HighStackLimit);
+	
+	// The function we are trying to look at may be compiled with correctly formed prologue+epilogue, or not.
+	// If it is not, RtlVirtualUnwind may hang or return ControlPc or zero.
+	if (Caller == 0 || Caller == ControlPc) {
+		Caller = EstablisherFrame[2]; // gcc saves lr to sp+8
+	}
+	
+	return Caller;
 }
 
 // Hook engine.
@@ -1890,18 +1956,18 @@ static ULONG PPCHook_EmitTocPrologue(PPPC_INSTRUCTION Destination, ULONG TocRegi
 	PPC_INSTRUCTION Instructions[6] = { 0 };
 	// mflr r0 ; get lr
 	Instructions[0].Long = 0x7C0802A6;
-	// stw r0, 4(r1) ; save lr
+	// stw r0, 8(r1) ; save lr
 	Instructions[1].Primary_Op = STW_OP;
 	Instructions[1].Dform_RS = 0;
 	Instructions[1].Dform_RA = 1;
-	Instructions[1].Dform_D = 4;
-	// stw r2, 8(r1) ; save toc
+	Instructions[1].Dform_D = 8;
+	// stw r2, 0xC(r1) ; save toc - must NOT touch 4(r1) as caller might have saved their toc there
 	Instructions[2].Primary_Op = STW_OP;
 	Instructions[2].Dform_RS = 2;
 	Instructions[2].Dform_RA = 1;
-	Instructions[2].Dform_D = 8;
-	// subi r1, r1, 0x38 ; buy stack frame
-	Instructions[3].Primary_Op = ADDI_OP;
+	Instructions[2].Dform_D = 0xC;
+	// stwu r1, -0x38(r1) ; buy stack frame
+	Instructions[3].Primary_Op = STWU_OP;
 	Instructions[3].Dform_RT = 1;
 	Instructions[3].Dform_RA = 1;
 	Instructions[3].Dform_D = -0x38;
@@ -2139,9 +2205,9 @@ BOOLEAN HalpHookKernelPeLoader(PVOID ImageBase) {
 	SectionLength -= 0x14;
 	PVOID TocRestoreEpilogue = InjectedSection;
 	InjectedSection[0] = 0x38210038; // addi r1, r1, 0x38 ; let go of stack frame
-	InjectedSection[1] = 0x80010004; // lwz r0, 4(r1) ; get lr
+	InjectedSection[1] = 0x80010008; // lwz r0, 8(r1) ; get lr
 	InjectedSection[2] = 0x7C0803a6; // mtlr r0 ; restore lr
-	InjectedSection[3] = 0x80410008; // lwz r2, 8(r1) ; restore toc
+	InjectedSection[3] = 0x8041000C; // lwz r2, 0xC(r1) ; restore toc
 	InjectedSection[4] = 0x4E800020; // blr ; return
 	InjectedSection += 5;
 	
@@ -2301,13 +2367,43 @@ BOOLEAN HalpHookKernelPeLoader(PVOID ImageBase) {
     PPC_HOOK_DO((PVOID*)&orig_##Name , hook_##Name); \
 } while (0)
 
+	GET_PROC_ADDRESS_ORIG_AND_HOOK(ObCreateObject);
+	//GET_PROC_ADDRESS_ORIG_AND_HOOK(ObReferenceObjectByPointer);
 	GET_PROC_ADDRESS_ORIG_AND_HOOK(MmCreateSection);
 	//GET_PROC_ADDRESS_ORIG_AND_HOOK(MmMapViewOfSection);
-	//GET_PROC_ADDRESS_ORIG_AND_HOOK(MmMapViewInSystemSpace);
+	GET_PROC_ADDRESS_ORIG_AND_HOOK(MmMapViewInSystemSpace);
 	GET_PROC_ADDRESS_ORIG_AND_HOOK(IoPageRead);
 	GET_PROC_ADDRESS_ORIG_AND_HOOK(FsRtlGetFileSize);
 	//GET_PROC_ADDRESS_ORIG_AND_HOOK(IofCallDriver);
-	//GET_PROC_ADDRESS_ORIG_AND_HOOK(MmPageEntireDriver);
+	GET_PROC_ADDRESS_ORIG_AND_HOOK(MmPageEntireDriver);
+	GET_PROC_ADDRESS_ORIG_AND_HOOK(RtlVirtualUnwind);
+	
+#if 0
+	// for debug: set PAGE_FAULT_IN_NONPAGED_AREA arg2 to faulting address
+	ULONG insn = 0x80a1022c; // lwz r5, 0x22c(r1)
+	// these addresses are for NT4 SP1 ntkrnlmp
+	*(PULONG)(0x8069b4a8 - 0x80648000 + ImageBase) = insn;
+	*(PULONG)(0x8069b4d8 - 0x80648000 + ImageBase) = insn;
+	*(PULONG)(0x8069b5a4 - 0x80648000 + ImageBase) = insn;
+#endif
+	
+	// Get RtlPcToFileHeader. This is the first bl instruction in RtlLookupFunctionEntry (exported)
+	
+	extern __declspec(dllimport) PVOID RtlLookupFunctionEntry (ULONG ControlPc);
+	PAIXCALL_FPTR AfLookupFunctionEntry = (PAIXCALL_FPTR)RtlLookupFunctionEntry;
+	PPPC_INSTRUCTION Insn = (PPPC_INSTRUCTION)AfLookupFunctionEntry->Function;
+	ULONG Count = 0;
+	for (; Count < 10; Insn++, Count++) {
+		if (Insn->Primary_Op != B_OP) continue;
+		if (!Insn->Iform_LK) continue;
+		break;
+	}
+	if (Count >= 10) {
+		RtlPcToFileHeader = NULL;
+	} else {
+		fp_RtlPcToFileHeader.Function = (ULONG)Insn + HookSignExtBranch(Insn->Iform_LI << 2);
+		fp_RtlPcToFileHeader.Toc = (ULONG)KernelToc;
+	}
 	
 	sync_before_exec((PULONG)((ULONG)ImageBase + SectionVa), SectionLength);
 	
