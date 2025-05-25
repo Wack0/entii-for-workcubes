@@ -100,6 +100,14 @@ static bool fs_init_and_mount(const char* mount, const DISC_INTERFACE* di) {
 	return ret;
 }
 
+static inline USHORT read16(ULONG addr)
+{
+	USHORT x;
+	__asm__ __volatile__(
+		"lhz %0,0(%1) ; sync" : "=r"(x) : "b"(addr));
+	return x;
+}
+
 #ifdef HW_RVL
 // patch IOS to always have all access rights set
 // original code from homebrew channel
@@ -118,14 +126,6 @@ static const u16 ticket_check[] = {
     0x4698,               // mov r8, r3  ; store it for the DVD video bitcheck later
     0x07DB                // lsls r3, r3, #31; check AHBPROT bit
 };
-
-static inline USHORT read16(ULONG addr)
-{
-	USHORT x;
-	__asm__ __volatile__(
-		"lhz %0,0(%1) ; sync" : "=r"(x) : "b"(addr));
-	return x;
-}
 
 static inline ULONG read32(ULONG addr)
 {
