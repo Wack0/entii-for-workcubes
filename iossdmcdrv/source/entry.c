@@ -541,6 +541,8 @@ NTSTATUS SdmcDiskCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 
 static void SdmcDiskStartIoImpl(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 
+extern __declspec(dllimport) KAFFINITY KeSetAffinityThread(PKTHREAD Thread, KAFFINITY Affinity);
+
 NTSTATUS SdmcDiskRw(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 	if (DeviceObject == s_EnvironmentDevice && Irp->RequestorMode != KernelMode) {
 		Irp->IoStatus.Status = STATUS_ACCESS_DENIED;
@@ -623,7 +625,10 @@ NTSTATUS SdmcDiskRw(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 	IoStartPacket(DeviceObject, Irp, &SectorOffset, NULL);
 	return STATUS_PENDING;
 #endif
+	
+	KAFFINITY OldAffinity = KeSetAffinityThread(KeGetCurrentThread(), 1);
 	SdmcDiskStartIoImpl(DeviceObject, Irp);
+	KeSetAffinityThread(KeGetCurrentThread(), OldAffinity);
 	return Irp->IoStatus.Status;
 }
 
