@@ -1,5 +1,6 @@
 #pragma once
 #include "types.h"
+#include "runtime.h"
 #include "pxiheap.h"
 
 // IOS file/device handle.
@@ -59,4 +60,4 @@ bool PxiIopIoctlAsyncActive(ULONG index);
 LONG PxiIopIoctlvAsync(IOS_HANDLE Handle, ULONG ControlCode, ULONG NumRead, ULONG NumWritten, PIOS_IOCTL_VECTOR Buffers, ULONG SwapBuffersIn, ULONG SwapBuffersOut, PVOID Context);
 bool PxiIopIoctlvAsyncPoll(ULONG index,LONG* Result, PVOID* Context);
 bool PxiIopIoctlvAsyncActive(ULONG index);
-void PxiInit(void);
+void PxiInit(ARTX_SYSTEM_TYPE SystemType);
