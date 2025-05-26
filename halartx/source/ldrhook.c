@@ -149,6 +149,13 @@ static BOOLEAN FindLengthOfCodeTable(ULONG ImageBase, PIMAGE_SECTION_HEADER Sect
 		ULONG SizeOfCave = 0;
 		while (SectionPtr > SectionStart) {
 			if (*SectionPtr != 0) break;
+			// If the byte before this 32-bit value isn't zero, then stop here to prevent overwriting any null terminator.
+			if (SectionPtr[-1] != 0) {
+				PUCHAR SectionPtr8 = (PUCHAR)SectionPtr;
+				if (SectionPtr8[-1] != 0) {
+					break;
+				}
+			}
 			SizeOfCave += sizeof(*SectionPtr);
 			SectionPtr--;
 		}
@@ -1116,7 +1123,7 @@ static BOOLEAN SectionContainsRva(PIMAGE_SECTION_HEADER Section, ULONG Rva) {
 static PIMAGE_SECTION_HEADER SectionContainingRva(PIMAGE_SECTION_HEADER Sections, ULONG NumberOfSections, ULONG Rva) {
 	for (int i = 0; i < NumberOfSections; i++) {
 		if (Rva < Sections[i].VirtualAddress) continue;
-		if (Rva >= Sections[i].VirtualAddress + Sections[i].Misc.VirtualSize) continue;
+		if (Rva >= Sections[i].VirtualAddress + Sections[i].SizeOfRawData) continue;
 		return &Sections[i];
 	}
 	return NULL;
@@ -1537,7 +1544,6 @@ NTSTATUS hook_FsRtlGetFileSize(PVOID FileObject, PLARGE_INTEGER FileSize) {
 			PatchEntry->PatchEntry.SizeOfInjectedSection  = TextCaveLength;
 			
 			// Ensure the VirtualSize is not less than SizeOfRawData for the text section, otherwise the text cave will be cut off.
-			// SectionContainingRva uses VirtualSize, so use the RVA of the start of the page, not the cave itself.
 			PIMAGE_SECTION_HEADER TextSection = SectionContainingRva(Sections, NumberOfSections, TextCaveRva & ~PAGE_SIZE);
 			if (TextSection == NULL) {
 				// what?
@@ -1702,7 +1708,7 @@ NTSTATUS hook_FsRtlGetFileSize(PVOID FileObject, PLARGE_INTEGER FileSize) {
 		if (pInjectedSection != NULL) MmUnmapViewInSystemSpace(pInjectedSection);
 
 		if (PatchError != 0) {
-			Status = 0xC032400DUL;
+			Status = 0xC0330000UL | PatchError;
 			ExFreePool(BitmapBuffer);
 			// Unmap view of sections.
 			MmUnmapViewInSystemSpace(pBaseSection); // (returns an NTSTATUS sure, but guaranteed to succeed)
@@ -2390,7 +2396,7 @@ BOOLEAN HalpHookKernelPeLoader(PVOID ImageBase) {
 	// Get RtlPcToFileHeader. This is the first bl instruction in RtlLookupFunctionEntry (exported)
 	
 	extern __declspec(dllimport) PVOID RtlLookupFunctionEntry (ULONG ControlPc);
-	PAIXCALL_FPTR AfLookupFunctionEntry = (PAIXCALL_FPTR)RtlLookupFunctionEntry;
+	PAIXCALL_FPTR AfLookupFunctionEntry = *(PAIXCALL_FPTR*)RtlLookupFunctionEntry;
 	PPPC_INSTRUCTION Insn = (PPPC_INSTRUCTION)AfLookupFunctionEntry->Function;
 	ULONG Count = 0;
 	for (; Count < 10; Insn++, Count++) {
