@@ -33,8 +33,28 @@ static ARC_STATUS StubGetReadStatus(ULONG FileId) { return _ESUCCESS; }
 static ARC_STATUS StubGetFileInformation(ULONG FileId, PFILE_INFORMATION FileInfo) { return _EINVAL; }
 
 // Declare display write routine
+static char s_ConsoleBuffer[255];
+static UCHAR s_ConsoleIdx;
 static ARC_STATUS DisplayWrite(ULONG FileId, PVOID Buffer, ULONG Length, PULONG Count) {
-    *Count = ArcConsoleWrite((PBYTE)Buffer, Length);
+    if (Length == 0) {
+        *Count = 0;
+        return _ESUCCESS;
+    }
+    // Work around a bug in MS code with ANSI escapes and multiple parameters.
+    // (the console code for this ARC firmware expects to see all ansi escape data in a single buffer)
+    PUCHAR Buf8 = (PUCHAR)Buffer;
+    if (Buf8[0] == 0x9B && Buf8[Length - 1] == ';' && (Length <= 0x10)) {
+        memcpy(s_ConsoleBuffer, Buffer, Length);
+        s_ConsoleIdx = Length;
+    }
+    else if (s_ConsoleIdx != 0 && (Length <= 0x10)) {
+        memcpy(&s_ConsoleBuffer[s_ConsoleIdx], Buffer, Length);
+        *Count = ArcConsoleWrite(s_ConsoleBuffer, s_ConsoleIdx + Length);
+        s_ConsoleIdx = 0;
+    }
+    else {
+        *Count = ArcConsoleWrite((PBYTE)Buffer, Length);
+    }
     return _ESUCCESS;
 }
 
