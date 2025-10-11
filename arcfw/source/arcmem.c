@@ -412,10 +412,17 @@ int ArcMemInitDescriptors(PHW_DESCRIPTION HwDesc) {
 	// If this is RVL there's no more memory
 	ULONG DdrIpcEndOff = (HwDesc->DdrIpcBase + HwDesc->DdrIpcLength) - 0x10000000;
 	if (DdrIpcEndOff == HwDesc->MemoryLength[1]) return 0;
+	
+	// Twelfth chunk: up to 64MB-aligned value as firmware permanent (IOS might use this memory)
+	ULONG IosEndOff = (DdrIpcEndOff / 0x4000000);
+	if ((DdrIpcEndOff % 0x4000000) != 0) IosEndOff++;
+	IosEndOff *= 0x4000000;
+	PageCount = ((0x10000000 + IosEndOff) / PAGE_SIZE) - BasePage;
+	INIT_DESCRIPTOR(11, BasePage, PageCount, MemoryFirmwarePermanent);
 
 	// Twelfth chunk: rest of RAM as firmware temporary
-	PageCount = (HwDesc->MemoryLength[1] / PAGE_SIZE) - BasePage;
-	INIT_DESCRIPTOR(11, BasePage, PageCount, MemoryFirmwareTemporary);
+	PageCount = ((0x10000000 + HwDesc->MemoryLength[1]) / PAGE_SIZE) - BasePage;
+	INIT_DESCRIPTOR(12, BasePage, PageCount, MemoryFirmwareTemporary);
 
 	// All done.
 	return 0;

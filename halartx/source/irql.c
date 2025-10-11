@@ -3,9 +3,7 @@
 #include "halp.h"
 #include "ints.h"
 
-extern PPI_INTERRUPT_REGS HalpPiInterruptRegs;
 extern ULONG HalpIrqlToMask[];
-extern ULONG HalpRegisteredInterrupts;
 
 extern __declspec(dllimport) void KiDispatchSoftwareInterrupt(void);
 
@@ -25,7 +23,10 @@ VOID KeLowerIrql(IN KIRQL NewIrql)
 		PCR->CurrentIrql = NewIrql;
 		
 		// Mask off the required interrupts for this IRQL.
-		if (HALPCR->PhysicalProcessor == 0 && HalpPiInterruptRegs != NULL) MmioWriteBase32(MMIO_OFFSET(HalpPiInterruptRegs, Mask), (HalpIrqlToMask[NewIrql] & HalpRegisteredInterrupts));
+		if (HalpPiInterruptRegs != NULL) {
+			if (HalpSystemIsCafe()) MmioWriteBase32(MMIO_PILT_OFFSET(Mask), (HalpIrqlToMask[NewIrql] & HalpRegisteredInterrupts));
+			else if (HALPCR->PhysicalProcessor == 0) MmioWriteBase32(MMIO_OFFSET(HalpPiInterruptRegs, Mask), (HalpIrqlToMask[NewIrql] & HalpRegisteredInterrupts));
+		}
 		
 		// If at or above CLOCK2_LEVEL then don't enable interrupts.
 		// (At or above CLOCK2_LEVEL => decremementer interrupt can't fire)
@@ -60,7 +61,10 @@ VOID KeRaiseIrql(IN KIRQL NewIrql, OUT PKIRQL OldIrql)
 	PCR->CurrentIrql = NewIrql;
 	
 	// Mask off the required interrupts for this IRQL.
-	if (HALPCR->PhysicalProcessor == 0 && HalpPiInterruptRegs != NULL) MmioWriteBase32(MMIO_OFFSET(HalpPiInterruptRegs, Mask), (HalpIrqlToMask[NewIrql] & HalpRegisteredInterrupts));
+	if (HalpPiInterruptRegs != NULL) {
+		if (HalpSystemIsCafe()) MmioWriteBase32(MMIO_PILT_OFFSET(Mask), (HalpIrqlToMask[NewIrql] & HalpRegisteredInterrupts));
+		else if (HALPCR->PhysicalProcessor == 0) MmioWriteBase32(MMIO_OFFSET(HalpPiInterruptRegs, Mask), (HalpIrqlToMask[NewIrql] & HalpRegisteredInterrupts));
+	}
 	
 	// If at or above CLOCK2_LEVEL then don't reenable interrupts.
 	if (NewIrql >= CLOCK2_LEVEL) return;

@@ -1,0 +1,2 @@
+arm-none-eabi-gcc -marm -march=armv5t -mbig-endian -O3 -nostdlib -nodefaultlibs -o payload.elf -Wl,-T,payload.ld payload.c
+arm-none-eabi-objcopy -O binary payload.elf payload.bin

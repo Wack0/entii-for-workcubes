@@ -83,11 +83,15 @@ KdPortInitialize (
     BOOLEAN Initialize
     )
 {
+	
 	// If the EXI registers have not yet been mapped, map them by a BAT.
 	if (!HalpMapExiRegsByBAT()) return FALSE;
 	
 	// If the debugger is not being enabled, do nothing more.
 	if (!Initialize) return TRUE;
+	
+	// On Cafe, there are no devices on the EXI bus
+	if (HalpSystemIsCafe()) return FALSE;
 	
 	// If some block device is at EXI1, bail.
 	ULONG ExiDevices = (ULONG)RUNTIME_BLOCK[RUNTIME_EXI_DEVICES];

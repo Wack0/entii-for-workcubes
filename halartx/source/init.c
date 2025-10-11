@@ -10,6 +10,8 @@ void HalpSetMmioDbat(void);
 
 BOOLEAN HalpFixLowMem(PLOADER_PARAMETER_BLOCK LoaderBlock);
 
+extern KSPIN_LOCK HalpDisplayAdapterLock;
+extern KSPIN_LOCK HalpSystemInterruptLock;
 
 NTHALAPI
 BOOLEAN
@@ -38,6 +40,7 @@ HalInitSystem (
 		if (Prcb->MajorVersion != PRCB_MAJOR_VERSION) {
 			if (Phase == 0 && Prcb->Number == 0) {
 				// This is phase 0 on first CPU, attempt to initialise the display for following bugcheck.
+				KeInitializeSpinLock(&HalpDisplayAdapterLock);
 				HalpInitializeDisplay0(LoaderBlock);
 			}
 			KeBugCheck(MISMATCHED_HAL);
@@ -49,6 +52,8 @@ HalInitSystem (
 			
 			// Fix low memory.
 			if (!HalpFixLowMem(LoaderBlock)) {
+				KeInitializeSpinLock(&HalpDisplayAdapterLock);
+				HalpInitializeDisplay0(LoaderBlock);
 				return FALSE;
 			}
 			
@@ -59,12 +64,8 @@ HalInitSystem (
 			KeSetTimeIncrement(MAXIMUM_INCREMENT, MINIMUM_INCREMENT);
 			
 			// Initialize all spin locks.
-			
-			// TODO: MP - actually implement these.
-			#if 0
 			KeInitializeSpinLock(&HalpDisplayAdapterLock);
 			KeInitializeSpinLock(&HalpSystemInterruptLock);
-			#endif
 			
 			// Don't map the EXI regs yet.
 			// If a bugcheck occurs they'll get mapped this early.
@@ -77,8 +78,11 @@ HalInitSystem (
 			}
 		}
 		
-		// TODO: MP - set this to core id on espresso
-		HALPCR->PhysicalProcessor = Prcb->Number;
+		if (HalpCpuIsEspresso()) {
+			HALPCR->PhysicalProcessor = __mfspr(SPR_PIR);
+		} else {
+			HALPCR->PhysicalProcessor = Prcb->Number;
+		}
 		
 		// Initialise decrementer timer values.
 		HalpCalibrateStall();
@@ -133,6 +137,7 @@ HalInitSystem (
 		// due to a hardware erratum, a sync instruction must be placed before the load/store instruction;
 		// thus any kind of exception after the sync instruction and before the actual load/store will cause hangs/crashes.
 		HalpSetMmioDbat();
+		HALPCR->SetBat = TRUE;
 		
 		return TRUE;
 		
@@ -164,6 +169,37 @@ HalInitializeProcessor (
 	HID4 &= ~HID4_SBE;
 	__mtspr(SPR_HID4, HID4);
 	#endif
+	
+	// Do espresso-specific init if needed.
+	if (ProcessorType == 0x7001 && !HalpSystemIsCafe()) {
+		// Enable PIR and make sure HID5 is enabled.
+		ULONG HID5 = __mfspr(SPR_HID5);
+		HID5 |= HID5_H5A | HID5_PIRE;
+		__mtspr(SPR_HID5, HID5);
+		
+		
+		// Grab the core id from PIR
+		ULONG PIR = __mfspr(SPR_PIR);
+		if (PIR == 0) {
+			// On core 0
+			
+			// Set some bits in CAR
+			ULONG CAR = __mfspr(SPR_CAR);
+			CAR |= 0xfc100000;
+			__mtspr(SPR_CAR, CAR);
+			// and a bit in BCR?
+#if 0 // this just hangs the powerpc
+			ULONG BCR = 0x08000000;
+			__mtspr(SPR_BCR, BCR);
+			asm volatile("isync");
+#endif
+			__mtspr(SPR_HID0, 0x11C024);
+			__mtspr(SPR_HID4, 0xB1B00000);
+		
+			HID5 |= 0x67FDC000; // This is what Cafe OS sets, with bit 27 unset (this bit specifically hangs the PPC in wiimode when set)
+			__mtspr(SPR_HID5, HID5);
+		}
+	}
 	
 	// Other HALs initialise the icache/dcache routines here.
 	// We know that we are an arthur derivative.

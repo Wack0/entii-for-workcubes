@@ -31,6 +31,19 @@ typedef struct {
 	volatile ULONG Unused2[2];
 	PI_INTERRUPT_CPU_LATTE Cpu[3];
 } PI_INTERRUPT_REGS_LATTE, *PPI_INTERRUPT_REGS_LATTE;
+_Static_assert(__builtin_offsetof(PI_INTERRUPT_REGS_LATTE, Cpu[0]) == 0x78);
+_Static_assert(__builtin_offsetof(PI_INTERRUPT_REGS_LATTE, Cpu[1]) == 0x80);
+_Static_assert(__builtin_offsetof(PI_INTERRUPT_REGS_LATTE, Cpu[2]) == 0x88);
+
+typedef union {
+	PPI_INTERRUPT_REGS Flipper;
+	PPI_INTERRUPT_REGS_LATTE Latte;
+} PI_INTERRUPT_REGS_BOTH;
+
+extern PI_INTERRUPT_REGS_BOTH HalpPiInterruptRegsBoth;
+#define HalpPiInterruptRegs HalpPiInterruptRegsBoth.Flipper
+#define HalpPiInterruptRegsLatte HalpPiInterruptRegsBoth.Latte
+#define MMIO_PILT_OFFSET(elem) HalpPiInterruptRegsLatte, (__builtin_offsetof(PI_INTERRUPT_REGS_LATTE, Cpu) + (sizeof(PI_INTERRUPT_CPU_LATTE) * __mfspr(SPR_PIR)) + __builtin_offsetof(PI_INTERRUPT_CPU_LATTE, elem))
 
 enum {
 	PI_INTERRUPT_REGS_BASE = 0x0c003000,

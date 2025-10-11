@@ -1104,6 +1104,50 @@ static void ARC_NORETURN IopUsbmsTest(void) {
 	}
 	while (1);
 }
+
+static void UnalignedStoresTest(ULONG size) {
+	const ULONG write32 = 0x12345678;
+	volatile UCHAR* ptr = (volatile UCHAR*)0x6000C000;
+	volatile UCHAR reference_buffer[32];
+	bool unaligned_broken = false;
+	for (ULONG i = 0; i <= 28; ++i) {
+		for (ULONG fill = 0; i < 32; i += 4) NativeWriteBase32(ptr, i, 0);
+		memset(reference_buffer, 0, sizeof(reference_buffer));
+
+		switch (size) {
+		case 1:
+			NativeWriteBase8(ptr, i, write32);
+			break;
+		case 2:
+			NativeWriteBase16(ptr, i, write32);
+			break;
+		case 4:
+			NativeWriteBase32(ptr, i, write32);
+			break;
+		}
+
+		switch (size) {
+		case 1:
+			NativeWriteBase8(reference_buffer, i, write32);
+			break;
+		case 2:
+			NativeWriteBase16(reference_buffer, i, write32);
+			break;
+		case 4:
+			NativeWriteBase32(reference_buffer, i, write32);
+			break;
+		}
+
+		if (memcmp(ptr, reference_buffer, sizeof(reference_buffer)) != 0) {
+			printf("Got erratum for %x(%d-byte): %08x %08x %08x %08x %08x %08x %08x %08x\r\n", i, size,
+				NativeReadBase32(ptr, 0), NativeReadBase32(ptr, 4), NativeReadBase32(ptr, 8), NativeReadBase32(ptr, 0xC),
+				NativeReadBase32(ptr, 0x10), NativeReadBase32(ptr, 0x14), NativeReadBase32(ptr, 0x18), NativeReadBase32(ptr, 0x1C));
+			unaligned_broken = true;
+		}
+	}
+
+	if (!unaligned_broken) printf("Unaligned stores fine for %d-byte\r\n", size);
+}
 #endif
 
 //---------------------------------------------------------------------------------
@@ -1114,21 +1158,52 @@ void ARC_NORETURN FwMain(PHW_DESCRIPTION Desc) {
 	memcpy(&StackDesc, Desc, sizeof(StackDesc));
 	Desc = &StackDesc;
 
-	// Acknowledge and mask off all interrupts.
-	MmioWriteBase32((PVOID)0x6C000000, 0x3004, 0); // PI_INTMASK = 0
-	MmioWriteBase32((PVOID)0x6C000000, 0x3000, 0xFFFFFFFF); // PI_INTSTATUS = 0xFFFFFFFF
+	// Determine system type.
+	ARTX_SYSTEM_TYPE SystemType = ARTX_SYSTEM_FLIPPER;
+	if ((Desc->FpFlags & FPF_IS_VEGAS) != 0) SystemType = ARTX_SYSTEM_VEGAS;
+	if ((Desc->FpFlags & FPF_IS_LATTE) != 0) SystemType = ARTX_SYSTEM_LATTE;
 
+	if (SystemType != ARTX_SYSTEM_LATTE) {
+		// Acknowledge and mask off all interrupts.
+		MmioWriteBase32((PVOID)0x6C000000, 0x3004, 0); // PI_INTMASK = 0
+		MmioWriteBase32((PVOID)0x6C000000, 0x3000, 0xFFFFFFFF); // PI_INTSTATUS = 0xFFFFFFFF
+	}
+	else {
+		MmioWriteBase32((PVOID)0x6C000000, 0x7C, 0); // PI_INTMASK = 0
+		MmioWriteBase32((PVOID)0x6C000000, 0x78, 0xFFFFFFFF); // PI_INTSTATUS = 0xFFFFFFFF
+		MmioWriteBase32((PVOID)0x6C000000, 0x84, 0); // PI_INTMASK = 0
+		MmioWriteBase32((PVOID)0x6C000000, 0x80, 0xFFFFFFFF); // PI_INTSTATUS = 0xFFFFFFFF
+		MmioWriteBase32((PVOID)0x6C000000, 0x8C, 0); // PI_INTMASK = 0
+		MmioWriteBase32((PVOID)0x6C000000, 0x88, 0xFFFFFFFF); // PI_INTSTATUS = 0xFFFFFFFF
+	}
+
+
+	// Latte uses an RGB framebuffer, not a YUV one.
+	if (SystemType == ARTX_SYSTEM_LATTE) {
+		ArcConsoleUseRgb();
+		// Set the framebuffers to 64-bit endian swap.
+		MmioWriteBase32((PVOID)0x6C200000, 0x610C, 3);
+		MmioWriteBase32((PVOID)0x6C200000, 0x618C, 3);
+		MmioWriteBase32((PVOID)0x6C200000, 0x690C, 3);
+		MmioWriteBase32((PVOID)0x6C200000, 0x698C, 3);
+	}
 	// Initialise the console. We know where it is. Just convert it from physical address to our BAT mapping.
 	ArcConsoleInit(MEM_PHYSICAL_TO_K1(Desc->FrameBufferBase), 20, 20, Desc->FrameBufferWidth, Desc->FrameBufferHeight, Desc->FrameBufferStride);
+	if (SystemType == ARTX_SYSTEM_LATTE) {
+		printf("\r\n\n\n");
+
+#if 0
+		// Check for the 60x bus erratum.
+		UnalignedStoresTest(1);
+		UnalignedStoresTest(2);
+		UnalignedStoresTest(4);
+#endif
+	}
 	
 	// Initialise the exception handlers.
 	//void ArcBugcheckInit(void);
 	//ArcBugcheckInit();
 
-	// Determine system type.
-	ARTX_SYSTEM_TYPE SystemType = ARTX_SYSTEM_FLIPPER;
-	if ((Desc->FpFlags & FPF_IS_VEGAS) != 0) SystemType = ARTX_SYSTEM_VEGAS;
-	if ((Desc->FpFlags & FPF_IS_LATTE) != 0) SystemType = ARTX_SYSTEM_LATTE;
 
 	// Initialise ARC memory descriptors. 
 	if (ArcMemInitDescriptors(Desc) < 0) {
@@ -1170,8 +1245,9 @@ void ARC_NORETURN FwMain(PHW_DESCRIPTION Desc) {
 	// PXI (where appropriate)
 	if (SystemType >= ARTX_SYSTEM_VEGAS) {
 		printf("Init pxi...\r\n");
-		PxiInit();
+		PxiInit(SystemType);
 		PxiHeapInit(Desc->DdrIpcBase, Desc->DdrIpcLength);
+		printf("Init sdmc...\r\n");
 		SdmcStartup();
 		printf("Init IOS USBv5...\r\n");
 		if (UlInit() >= 0) {
@@ -1224,7 +1300,7 @@ void ARC_NORETURN FwMain(PHW_DESCRIPTION Desc) {
 
 	// GX FIFO buffer.
 	s_RuntimeGx.PointerArc = Desc->GxFifoBase;
-	s_RuntimeGx.Length = 0x10000;
+	s_RuntimeGx.Length = Desc->FrameBufferBase - Desc->GxFifoBase;
 	s_RuntimePointers[RUNTIME_GX_FIFO].v = (ULONG)&s_RuntimeGx;
 
 	// System type.

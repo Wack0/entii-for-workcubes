@@ -32,6 +32,10 @@ enum {
 
 // only let the heap implementation use the first 4MB of MEM1
 void* __myArena1Hi = MEM_PHYSICAL_TO_K0(PHYSADDR_LOAD);
+#ifdef HW_RVL
+// ...and do not touch MEM2
+u32 MALLOC_MEM2 = 0;
+#endif
 
 static GXRModeObj *rmode = NULL;
 
@@ -94,6 +98,14 @@ static bool fs_init_and_mount(const char* mount, const DISC_INTERFACE* di) {
 	}
 	printf("\n");
 	return ret;
+}
+
+static inline USHORT read16(ULONG addr)
+{
+	USHORT x;
+	__asm__ __volatile__(
+		"lhz %0,0(%1) ; sync" : "=r"(x) : "b"(addr));
+	return x;
 }
 
 #ifdef HW_RVL
@@ -415,6 +427,587 @@ draw_square (Mtx v)
 	GX_End ();
 }
 
+#ifdef HW_RVL
+
+#define _CPU_ISR_Enable() \
+	do { \
+		u32 _val = 0; \
+		__asm__ __volatile__ ( \
+			"mfmsr %0\n" \
+			"ori %0,%0,0x8000\n" \
+			"mtmsr %0" \
+			: "=&r" ((_val)) : "0" ((_val)) \
+			: : "memory" \
+		); \
+	} while (0)
+
+#define _CPU_ISR_Disable( _isr_cookie ) \
+	do { \
+		u32 _disable_mask = 0; \
+		_isr_cookie = 0; \
+		__asm__ __volatile__ ( \
+			"mfmsr %0\n" \
+			"rlwinm %1,%0,0,17,15\n" \
+			"mtmsr %1\n" \
+			"extrwi %0,%0,1,16" \
+			: "=&r" ((_isr_cookie)), "=&r" ((_disable_mask)) \
+			: "0" ((_isr_cookie)), "1" ((_disable_mask)) \
+			: "memory" \
+		); \
+	} while (0)
+
+#define _CPU_ISR_Restore( _isr_cookie )  \
+	do { \
+		u32 _enable_mask = 0; \
+		__asm__ __volatile__ ( \
+			"cmpwi %0,0\n" \
+			"beq 1f\n" \
+			"mfmsr %1\n" \
+			"ori %1,%1,0x8000\n" \
+			"mtmsr %1\n" \
+			"1:" \
+			: "=r"((_isr_cookie)),"=&r" ((_enable_mask)) \
+			: "0"((_isr_cookie)),"1" ((_enable_mask)) \
+			: "memory" \
+		); \
+	} while (0)
+
+extern void udelay(u32 us);
+
+// encoder/i2c driver isn't exported so we need our own copy
+static u32 i2cIdentFirst = 0;
+static u32 i2cIdentFlag = 1;
+static vu32* const _i2cReg = (u32*)0xCD800000;
+
+static inline void __viOpenI2C(u32 channel)
+{
+	u32 val = ((_i2cReg[49]&~0x8000)|0x4000);
+	val |= _SHIFTL(channel,15,1);
+	_i2cReg[49] = val;
+}
+
+static inline u32 __viSetSCL(u32 channel)
+{
+	u32 val = (_i2cReg[48]&~0x4000);
+	val |= _SHIFTL(channel,14,1);
+	_i2cReg[48] = val;
+	return 1;
+}
+static inline u32 __viSetSDA(u32 channel)
+{
+	u32 val = (_i2cReg[48]&~0x8000);
+	val |= _SHIFTL(channel,15,1);
+	_i2cReg[48] = val;
+	return 1;
+}
+
+static inline u32 __viGetSDA(void)
+{
+	return _SHIFTR(_i2cReg[50],15,1);
+}
+
+static inline void __viCheckI2C(void)
+{
+	__viOpenI2C(0);
+	udelay(4);
+
+	i2cIdentFlag = 0;
+	if(__viGetSDA()!=0) i2cIdentFlag = 1;
+}
+
+static u32 __sendSlaveAddress(u8 addr)
+{
+	u32 i;
+
+	__viSetSDA(i2cIdentFlag^1);
+	udelay(2);
+
+	__viSetSCL(0);
+	for(i=0;i<8;i++) {
+		if(addr&0x80) __viSetSDA(i2cIdentFlag);
+		else __viSetSDA(i2cIdentFlag^1);
+		udelay(2);
+
+		__viSetSCL(1);
+		udelay(2);
+
+		__viSetSCL(0);
+		addr <<= 1;
+	}
+
+	__viOpenI2C(0);
+	udelay(2);
+
+	__viSetSCL(1);
+	udelay(2);
+
+	if(i2cIdentFlag==1 && __viGetSDA()!=0) return 0;
+
+	__viSetSDA(i2cIdentFlag^1);
+	__viOpenI2C(1);
+	__viSetSCL(0);
+
+	return 1;
+}
+
+static u32 __VISendI2CData(u8 addr,void *val,u32 len)
+{
+	u8 c;
+	s32 i,j;
+	u32 level,ret;
+
+	if(i2cIdentFirst==0) {
+		__viCheckI2C();
+		i2cIdentFirst = 1;
+	}
+
+	_CPU_ISR_Disable(level);
+
+	__viOpenI2C(1);
+	__viSetSCL(1);
+
+	__viSetSDA(i2cIdentFlag);
+	udelay(4);
+
+	ret = __sendSlaveAddress(addr);
+	if(ret==0) {
+		_CPU_ISR_Restore(level);
+		return 0;
+	}
+
+	__viOpenI2C(1);
+	for(i=0;i<len;i++) {
+		c = ((u8*)val)[i];
+		for(j=0;j<8;j++) {
+			if(c&0x80) __viSetSDA(i2cIdentFlag);
+			else __viSetSDA(i2cIdentFlag^1);
+			udelay(2);
+
+			__viSetSCL(1);
+			udelay(2);
+			__viSetSCL(0);
+
+			c <<= 1;
+		}
+		__viOpenI2C(0);
+		udelay(2);
+		__viSetSCL(1);
+		udelay(2);
+
+		if(i2cIdentFlag==1 && __viGetSDA()!=0) {
+			_CPU_ISR_Restore(level);
+			return 0;
+		}
+
+		__viSetSDA(i2cIdentFlag^1);
+		__viOpenI2C(1);
+		__viSetSCL(0);
+	}
+
+	__viOpenI2C(1);
+	__viSetSDA(i2cIdentFlag^1);
+	udelay(2);
+	__viSetSDA(i2cIdentFlag);
+
+	_CPU_ISR_Restore(level);
+	return 1;
+}
+
+static void __VIWriteI2CRegister8(u8 reg, u8 data)
+{
+	u8 buf[2];
+	buf[0] = reg;
+	buf[1] = data;
+	__VISendI2CData(0xe0,buf,2);
+	udelay(2);
+}
+
+static void __VIWriteI2CRegister16(u8 reg, u16 data)
+{
+	u8 buf[3];
+	buf[0] = reg;
+	buf[1] = data >> 8;
+	buf[2] = data & 0xFF;
+	__VISendI2CData(0xe0,buf,3);
+	udelay(2);
+}
+
+#if 0
+static void __VIWriteI2CRegister32(u8 reg, u32 data)
+{
+	u8 buf[5];
+	buf[0] = reg;
+	buf[1] = data >> 24;
+	buf[2] = (data >> 16) & 0xFF;
+	buf[3] = (data >> 8) & 0xFF;
+	buf[4] = data & 0xFF;
+	__VISendI2CData(0xe0,buf,5);
+	udelay(2);
+}
+
+static void __VIWriteI2CRegisterBuf(u8 reg, int size, u8 *data)
+{
+	u8 buf[0x100];
+	buf[0] = reg;
+	memcpy(&buf[1], data, size);
+	__VISendI2CData(0xe0,buf,size+1);
+	udelay(2);
+}
+#endif
+
+
+static void __VISetTiming(u8 mode)
+{
+	__VIWriteI2CRegister8(0x00, mode);
+}
+
+#if 0
+static void __VISetOutputMode(u8 dtvstatus)
+{
+	switch (currTvMode)
+	{
+	case VI_NTSC:
+	default:
+		vdacFlagRegion = 0; break;
+	case VI_MPAL:
+		vdacFlagRegion = 1; break;
+	case VI_PAL:
+	case VI_EURGB60:
+		vdacFlagRegion = 2; break;
+	case VI_DEBUG:
+	case VI_DEBUG_PAL:
+		vdacFlagRegion = 3; break;
+	}
+
+	__VIWriteI2CRegister8(0x01, _SHIFTL(dtvstatus,5,3)|(vdacFlagRegion&0x1f));
+}
+#endif
+
+static void __VISetVBlankData(bool cgms, bool wss, bool captions)
+{
+	u8 data = (captions ? 0 : 1) | (cgms ? 0 : 1) << 1 | (cgms ? 0 : 1) << 2;
+	__VIWriteI2CRegister8(0x02, data);
+}
+
+#if 0
+static void __VISetTrapFilter(bool enable)
+{
+	__VIWriteI2CRegister8(0x03, enable ? 1 : 0);
+}
+#endif
+
+static void __VISetOutputEnable(bool enable)
+{
+	__VIWriteI2CRegister8(0x04, enable ? 1 : 0);
+}
+
+#if 0
+static void __VISetCGMSData(u8 param1, u8 param2, u8 param3)
+{
+	__VIWriteI2CRegister16(0x05, (param1 & 3) << 8 | (param2 & 0xf) << 10 | param3);
+}
+
+static void __VIResetCGMSData(void)
+{
+	__VISetCGMSData(0, 0, 0);
+}
+
+static void __VISetWSSData(u8 param1, u8 param2, u8 param3, u8 param4)
+{
+	__VIWriteI2CRegister16(0x08, (param1 & 0xf) << 8 | (param2 & 0xf) << 12 | (param3 & 0x7) << 3 | (param4 & 0x7));
+}
+
+static void __VIResetWSSData(void)
+{
+	__VISetWSSData(0, 0, 0, 0);
+}
+
+static void __VISetOverDrive(bool enable, u8 level)
+{
+	__VIWriteI2CRegister8(0x0A, (level << 1) | (enable ? 1 : 0));
+}
+
+static void __VISetGamma(void)
+{
+	u8 gamma[0x21] = {
+		0x10, 0x00, 0x10, 0x00, 0x10, 0x00, 0x10, 0x00,
+		0x10, 0x00, 0x10, 0x00, 0x10, 0x20, 0x40, 0x60,
+		0x80, 0xa0, 0xeb, 0x10, 0x00, 0x20, 0x00, 0x40,
+		0x00, 0x60, 0x00, 0x80, 0x00, 0xa0, 0x00, 0xeb,
+		0x00
+	};
+	__VIWriteI2CRegisterBuf(0x10, sizeof(gamma), gamma);
+}
+
+static void __VISetMacroVision(u8 rgb)
+{
+	u8 macrobuf[0x1a];
+
+	memset(macrobuf, 0, sizeof(macrobuf));
+	__VIWriteI2CRegisterBuf(0x40, sizeof(macrobuf), macrobuf);
+	if (rgb) __VIWriteI2CRegister8(0x59, 1);
+}
+
+static void __VISetRGBChannelSwap(bool enable)
+{
+	__VIWriteI2CRegister8(0x62, enable ? 1 : 0);
+}
+#endif
+
+static void __VISetOverSampling(u8 mode)
+{
+	__VIWriteI2CRegister8(0x65, mode);
+}
+
+static void __VISetClosedCaptionMode(u8 mode)
+{
+	__VIWriteI2CRegister8(0x6A, mode);
+}
+
+#if 0
+static void __VISetRGBFilter(bool enable)
+{
+	__VIWriteI2CRegister8(0x6e, enable ? 1 : 0);
+}
+#endif
+
+static void __VISetAudioVolume(u8 left_chan, u8 right_chan)
+{
+	u16 data = (left_chan << 8) | right_chan;
+	__VIWriteI2CRegister16(0x71, data);
+}
+
+#if 0
+static void __VISetClosedCaptionData(u8 param1, u8 param2, u8 param3, u8 param4)
+{
+	u32 data = (param1 & 0x7f) << 24 | (param2 & 0x7f) << 16 | (param3 & 0x7f) << 8 | (param4 & 0x7f);
+	__VIWriteI2CRegister32(0x7A, data);
+}
+
+static void __VIResetClosedCaptionData(void)
+{
+	__VISetClosedCaptionData(0, 0, 0, 0);
+}
+#endif
+
+static void video_encoder_init_vga(void) {
+	__VISetOutputEnable(false);
+	
+	__VISetClosedCaptionMode(false);
+	udelay(2);
+	__VISetOverSampling(1);
+	udelay(2);
+	__VIWriteI2CRegister8(0x01, 0x23);
+	udelay(2);
+	
+	__VISetTiming(0);
+	// __VISetTrapFilter(false);
+	__VISetAudioVolume(0x8e, 0x8e);
+	// __VISetOverDrive(true, 0);
+	__VISetVBlankData(false, false, false);
+	// __VIResetCGMSData();
+	// __VIResetWSSData();
+	// __VIResetClosedCaptionData();
+	// __VISetMacroVision(false);
+	__VIWriteI2CRegister8(0x59, 0);
+	
+	
+	udelay(2);
+	VIDEO_Flush();
+	VIDEO_WaitVSync();
+	__VISetOutputEnable(true);
+}
+#endif
+
+#ifdef HW_RVL
+#define mfpvr() ({u32 _rval; \
+		__asm__ __volatile__ ("mfpvr %0" : "=r"(_rval)); _rval;})
+
+// Pwn IOS:
+// - Enforce PPC access to all hardware.
+// - On vWii, reboot PPC and race its bootrom to gain access to the other 2 cores.
+//   Cafe OS uses core1 as main core due to its extra cache.
+//   We must use core0 as main core as compat PI only allows core0 interrupts.
+static void EnchantIOP(void) {
+	//printf("PVR = %08x\n", mfpvr());
+	if ((read32(0xCD800064) == 0xFFFFFFFF) ? 1 : 0) {
+		// PPC already has access to all hardware.
+		// If this isn't vWii, no need to do anything.
+		if ((read32(0xCD8005A0) >> 16) != 0xCAFE) return;
+		// If not in broadway compat mode, do nothing.
+		if ((mfpvr() >> 16) != 8) return;
+		//printf("Gaining root...\n");
+	} //else printf("Gaining AHBPROT and IOS root...\n");
+	
+	if (IOS_GetVersion() != 58) {
+		// we want IOS58.
+		IOS_ReloadIOS(58);
+	}
+	
+	// Use the /dev/sha exploit.
+	// Thanks BroadOn for all the bugs :3
+	static u32 stage1[] = {
+		0x4903468D, // ldr r1, =0x10100000; mov sp, r1;
+		0x49034788, // ldr r1, =entrypoint; blx r1;
+		/* Overwrite reserved handler to loop infinitely */
+		0x49036209, // ldr r1, =0xFFFF0014; str r1, [r1, #0x20];
+		0x47080000, // bx r1
+		0x10100000, // temporary stack
+		0x41414141, // entrypoint
+		0xFFFF0014, // reserved handler
+	};
+	
+	static u32 iop_kernel_mode[] = {
+		// give PPC access to all hardware
+		0xe3a04536, // mov r4, #0x0D800000
+		0xe3e05000, // mov r5, #0xFFFFFFFF
+		0xe5845064, // str r5, [r4, #0x64]
+		// set PPC uid as root
+		0xe92d4003, // push {r0-r1, lr}
+		0xe3a0000f, // mov r0, #15 ; PROCESS_ID_PPCIPC
+		0xe3a01000, // mov r1, #0 ; USER_ID_ROOT
+		0xe6000570, // syscall IOS_SetUid
+		0xe8bd4003, // pop {r0-r1, lr}
+		0xe3a05cff, // mov r5, #0xff00
+		0xe5845024, // str r5, [r4, #0x24]
+		0xe12fff1e, // bx lr
+	};
+	
+	// We don't care about the very start of memory.
+	// (Napa/Splash size is at offset 0x28, we aren't overwriting that much)
+	u32* napa = (u32*)0x80000000;
+	u32* ddr = (u32*)0x91000000;
+	memcpy(napa, stage1, sizeof(stage1));
+	napa[5] = (u32)MEM_K0_TO_PHYSICAL(iop_kernel_mode);
+	DCFlushRange(napa, 0x20);
+	
+	int hSha = IOS_Open("/dev/sha", IPC_OPEN_NONE);
+	if (hSha < 0) return;
+	
+	ioctlv vec[3] = {0};
+	vec[1].data = (void*)0xfffe0028;
+	vec[2].data = MEM_K0_TO_PHYSICAL(0x80000000);
+	vec[2].len = 0x20;
+	
+	// broadon was cursed to never write secure code, amirite
+	IOS_Ioctlv(hSha, 0, 1, 2, vec);
+	// wait for context switch to idle thread
+	//sleep(1);
+	for (int i = 0; i < 1000000; i++) {
+		if (read32(0xCD800024) == 0xFF00) break;
+		udelay(1);
+	}
+	IOS_Close(hSha);
+	
+	// make sure it worked
+	write32(0xCD800024, 0);
+	if (read32(0xCD800064) != 0xFFFFFFFF) {
+		return;
+	}
+	
+	// do more only if in wiimode on cafe
+	if ((read32(0xCD8005A0) >> 16) != 0xCAFE) {
+		return;
+	}
+	
+	// read ancast into memory.
+	// 0x3f100 bytes at offset 0x500, to physaddr 0x01230000
+	// arm payload will copy to 0x01330000
+	const char ancast_path[] = "/title/00000001/00000200/content/00000003.app";
+	int hAncast = IOS_Open(ancast_path, IPC_OPEN_READ);
+	if (hAncast < 0) return;
+	bool ancastSuccess = false;
+	do {
+		if (IOS_Seek(hAncast, 0x500, 0) < 0) break;
+		if (IOS_Read(hAncast, (void*)0x81230000, 0x3f100) != 0x3f100) break;
+		if (read32(0xc1230000) != 0xefa282d9) break;
+		ancastSuccess = true;
+	} while (0);
+	IOS_Close(hAncast);
+	if (!ancastSuccess) {
+		return;
+	}
+	
+	// first up, restart IOS to ensure icache + dcache are wiped
+	// we lose root, but we only needed it to read the ancast image so...
+	// Get IOS current version
+	s32 ios = IOS_GetVersion();
+	if (ios < 0) ios = IOS_GetPreferredVersion();
+	if (ios >= 3) {
+		// Patch to always set AHBPROT on loading TMD
+		patch_ahbprot_reset();
+		// reload IOS, get rid of our existing environment
+		// try IOS58 first then fall back
+		if (ios == 58 || IOS_ReloadIOS(58) < 0) IOS_ReloadIOS(ios);
+		// and patch again, in case we reload again
+		patch_ahbprot_reset();
+	}
+	
+	// make sure ios version is correct
+	if (read32(0xC0003140) != 0x3a1920) {
+		return;
+	}
+	// get ARM kernel mode code execution again,
+	// this time to race the PPC bootrom and get espresso-mode code execution
+	
+	static u32 iop_kernel_mode_restart_ppc[] = {
+		#include "ppc_race_payload.inc"
+	};
+
+	static u32 ppc_payload_write[] = {
+		0x38800000, // li r4, 0
+		0x90840000, // stw r4, 0(r4)
+		0x7c0420ac, // dcbf r4, r4
+		0x7c0004ac, // sync
+	};
+	
+	static u32 ppc_payload[] = {
+		0x38600000 | (0x4000 - sizeof(ppc_payload_write)), // li r3, x
+		0x38800000, // li r4, 0
+		0x7c7a03a6, // mtsrr0 r3
+		0x7c9b03a6, // mtsrr1 r4
+		0x4c000064, // rfi
+		0x48000000, // b .
+		0x60000000, // nop
+	};
+	
+	memcpy(ddr, iop_kernel_mode_restart_ppc, sizeof(iop_kernel_mode_restart_ppc));
+	memcpy((void*)0x81320000, ppc_payload, sizeof(ppc_payload));
+	memcpy((void*)(0x80004000 - sizeof(ppc_payload_write)), ppc_payload_write, sizeof(ppc_payload_write));
+	memset((void*)0x816fffe0, 0, 0x20);
+
+	memcpy(napa, stage1, sizeof(stage1));
+	napa[5] = (u32)MEM_K0_TO_PHYSICAL(ddr);
+	DCFlushRange(napa, 0x20);
+	DCFlushRange(ddr, ((sizeof(iop_kernel_mode_restart_ppc) / 0x20) + 1) * 0x20);
+	DCFlushRange((void*)0x81320000, 0x100);
+	DCFlushRange((void*)0x816fffe0, 0x20);
+	DCFlushRange((void*)(0x80004000 - sizeof(ppc_payload_write)), 0x20);
+	
+	// run exploit to reset ppc
+	hSha = IOS_Open("/dev/sha", IPC_OPEN_NONE);
+	if (hSha < 0) return;
+	ioctlv vec2[3] = {0};
+	vec2[1].data = (void*)0xfffe0028;
+	vec2[2].data = MEM_K0_TO_PHYSICAL(0x80000000);
+	vec2[2].len = 0x20;
+	
+	// wait for ios to fully come up
+	//sleep(1);
+	
+	// close libogc IOS handles
+	__IOS_ShutdownSubsystems();
+	
+	
+	
+	// bye bye
+	IOS_Ioctlv(hSha, 0, 1, 2, vec2);
+	// just hang until pwned IOP puts this cpu back into reset
+	while (1);
+}
+
+#endif
+
 int main(int argc, char** argv) {
 	// Initialise the video system
 	VIDEO_Init();
@@ -423,15 +1016,63 @@ int main(int argc, char** argv) {
 	// On RVL: This will correspond to the settings in the Wii menu
 	// On DOL: This will correspond to the current mode plus used cable type
 	rmode = VIDEO_GetPreferredMode(NULL);
+	#ifdef HW_RVL
+	bool isRva = true;
+	// Detect if running on RVA.
+	// RVA has some custom hardware attached to EXI0:0 and EXI1:0.
+	// Both of them output the same value when getting EXI ID.
+	EXI_Probe(0);
+	EXI_Probe(1);
+	{
+		u32 id0 = 0, id1 = 0;
+		isRva =
+			EXI_GetID(0, 0, &id0) != 0 &&
+			EXI_GetID(1, 0, &id1) != 0 &&
+			id0 == id1 &&
+			id0 == 0xFF800000;
+	}
+	if (isRva) rmode = &TVNtsc480Prog;
+	
+	if (*(PULONG)0x80001800 == 0 && *(PULONG)0x80001804 == 'STUB') {
+		// Do not try to run an IOS exploit if this isn't real hardware.
+	} else {
+		// Cast a spell on the IOP, we want more than what it's given us
+		EnchantIOP();
+	}
+	#endif
 	
 	// Get size of Splash/Napa (MEM1), DDR (MEM2)
 	ULONG SplashSize = *(PULONG)(0x80000028);
 	ULONG DdrSize = 0;
 	ULONG DdrIpcSize = 0; // from end of DDR
+	ULONG RealDdrSize = 0;
 	#ifdef HW_RVL
 	DdrSize = *(PULONG)(0x80003120) - 0x90000000;
 	DdrIpcSize = DdrSize - (*(PULONG)(0x80003130) - 0x90000000);
-	#endif
+	RealDdrSize = DdrSize;
+	if ((read32(0xCD800064) == 0xFFFFFFFF) ? 1 : 0) {
+		// We have full hardware access.
+		// Disable DDR memory protection.
+		write16(MEM2_PROT, 0);
+		// We now can check various registers.
+		// Devkits have two ranks of DDR.
+		if (read16(0xCD8B4216) == 1) {
+			// This is really 128MB, if this thing is running 64MB IOS then override the size
+			if (RealDdrSize <= 0x4000000) RealDdrSize = 0x8000000;
+		}
+		// On vWii we can modify a single register and get 256MB of DDR
+		if ((read32(0xCD8005A0) >> 16) == 0xCAFE) {
+			write16(0xCD8B421A, 0x3FFF);
+			RealDdrSize = 0x10000000;
+		}
+	}
+	#else
+	// This is a gamecube, it might have double Splash if it's a devkit
+	if (read16(0xCC004028) == 3) {
+		// 48MB configuration
+		if (SplashSize <= 0x1800000) SplashSize = 0x3000000;
+	}
+	#endif	
 	
 	// Get bus and cpu speed
 	ULONG BusSpeed = *(PULONG)(0x800000F8);
@@ -491,6 +1132,11 @@ int main(int argc, char** argv) {
 	// Wait for Video setup to complete
 	VIDEO_WaitVSync();
 	if(rmode->viTVMode&VI_NON_INTERLACE) VIDEO_WaitVSync();
+	
+	#ifdef HW_RVL
+	// If this is RVA, set the video encoder into the correct mode
+	if (isRva) video_encoder_init_vga();
+	#endif
 	
 	// Initialise GX
 	GX_Init((PVOID)FifoVirt, GX_FIFO_SIZE);
@@ -614,7 +1260,7 @@ int main(int argc, char** argv) {
 	// We now have free memory at exactly 4MB, we can use this to store our descriptor.
 	PHW_DESCRIPTION Desc = (PHW_DESCRIPTION) Addr;
 	Desc->MemoryLength[0] = SplashSize;
-	Desc->MemoryLength[1] = DdrSize;
+	Desc->MemoryLength[1] = RealDdrSize;
 	Desc->DdrIpcBase = (DdrSize - DdrIpcSize) + 0x10000000;
 	Desc->DdrIpcLength = DdrIpcSize;
 	Desc->DecrementerFrequency = BusSpeed / 4;

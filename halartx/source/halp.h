@@ -17,21 +17,7 @@ static inline BOOLEAN HalpBusIsInternal(INTERFACE_TYPE InterfaceType) {
 	return InterfaceType == Internal || InterfaceType == VMEBus;
 }
 
-#define BIT(x) (1 << (x))
-
-#define __mfspr(spr)    \
-  ({ ULONG mfsprResult; \
-     __asm__ volatile ("mfspr %0, %1" : "=r" (mfsprResult) : "n" (spr)); \
-     mfsprResult; })
-
-#define __mtspr(spr, value)     \
-  __asm__ volatile ("mtspr %0, %1" : : "n" (spr), "r" (value))
-
-#define SPR_HID4 1011
-
-enum {
-	HID4_SBE = 0x02000000
-};
+#include "halpsys.h"
 
 ULONGLONG HalpReadTimeBase(void);
 
@@ -82,9 +68,11 @@ extern ULONG HalpPciMaxBuses;  // in pxpcibus.c
 typedef struct {
     ULONG                    PhysicalProcessor;
     ULONG                    HardPriority;
+	ULONG                    SetBat;
 } UNIPROCESSOR_DATA, *PUNIPROCESSOR_DATA;
 
 #define HALPCR  ((PUNIPROCESSOR_DATA)&PCR->HalReserved)
+#define HalpRegisteredInterrupts HALPCR->HardPriority
 
 //
 // Override standard definition of _enable/_disable for this compiler.

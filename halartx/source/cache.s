@@ -46,6 +46,10 @@ FlushRange:
 	dcbf    r.0, r.3
         addi    r.3, r.3, 0x20
 	bdnz	FlushRange
+	subi r.3, r.3, 0x20
+	dcbf r.0, r.3
+	sync
+	eieio
 
         LEAF_EXIT(HalSweepDcache)
 
@@ -107,11 +111,16 @@ FlashInvalidateIcache:
 // if length is zero, do nothing
 	beqlr-
 	mtctr	r.4
+	DISABLE_INTERRUPTS(r.10,r.12)
 
 InvalidateIcache:
 	icbi    0, r.3
+	sync
         addi    r.3, r.3, BLOCK_SIZE
 	bdnz	InvalidateIcache
+	sync
+	isync
+	ENABLE_INTERRUPTS(r.10)
 
         LEAF_EXIT(HalSweepIcacheRange)
 

@@ -10,10 +10,10 @@ typedef struct _LDR_DATA_TABLE_ENTRY {
 	// ...
 } LDR_DATA_TABLE_ENTRY, *PLDR_DATA_TABLE_ENTRY;
 
-PVOID PeGetExport(PVOID ImageBase, PCHAR ExportName);
+PVOID PeGetExport(PVOID ImageBase, const char* ExportName);
 
 typedef void (*tfpMmAllocateHPT)(ULONG Size, PLOADER_PARAMETER_BLOCK LoaderBlock);
-static volatile ULONG s_HashPageTables = NULL;
+static volatile ULONG s_HashPageTables = 0;
 
 #define __mtspr(spr, value)     \
   __asm__ volatile ("mtspr %0, %1" : : "n" (spr), "r" (value))

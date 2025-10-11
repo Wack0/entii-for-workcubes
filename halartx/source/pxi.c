@@ -32,6 +32,8 @@ struct _IOS_IPC_REQUEST_ENTRY {
 };
 
 static LIST_ENTRY s_IpcRequestPendingList;
+static KSPIN_LOCK s_IpcRequestPendingSpinLock;
+static KSPIN_LOCK s_IpcMemorySpinLock;
 
 //static ULONG s_CurrentRequest = 0;
 static LONG s_NumberOfRequestsToAck = 0;
@@ -40,8 +42,27 @@ static KDPC
 	s_DpcRequestAck[IPC_REQUEST_COUNT],
 	s_DpcResponseSent[IPC_REQUEST_COUNT];
 
+#if 0
+static KIRQL PxipAcquireSpinLock(PKSPIN_LOCK SpinLock) {
+	KIRQL CurrentIrql = KeGetCurrentIrql();
+	if (CurrentIrql < DISPATCH_LEVEL) KeRaiseIrql(DISPATCH_LEVEL, &CurrentIrql);
+	KiAcquireSpinLock(SpinLock);
+	return CurrentIrql;
+}
+
+static void PxipReleaseSpinLock(PKSPIN_LOCK SpinLock, KIRQL OldIrql) {
+	KiReleaseSpinLock(SpinLock);
+	if (OldIrql < DISPATCH_LEVEL) KeLowerIrql(OldIrql);
+}
+#endif
+
+#define PxipAcquireSpinLock(SpinLock) KeAcquireSpinLockRaiseToDpc((SpinLock))
+#define PxipReleaseSpinLock(SpinLock, OldIrql) KeReleaseSpinLock((SpinLock), (OldIrql))
+
 static void HalpPxiAddRequest(PIOS_IPC_REQUEST_ENTRY Entry) {
+	KIRQL OldIrql = PxipAcquireSpinLock(&s_IpcRequestPendingSpinLock);
 	InsertHeadList(&s_IpcRequestPendingList, &Entry->ListEntry);
+	PxipReleaseSpinLock(&s_IpcRequestPendingSpinLock, OldIrql);
 }
 
 static void HalpPxiRemoveRequest(PIOS_IPC_REQUEST_ENTRY Entry) {
@@ -151,14 +172,16 @@ static NTSTATUS HalpIosErrorToNtStatus(int err) {
 	return (NTSTATUS)Status;
 }
 
-static void HalpIpcSendOneRequestImpl(PLIST_ENTRY SendList);
+static void HalpIpcSendOneRequestFromDpcLevel(PLIST_ENTRY SendList);
 
 static void HalpPxiRequestAck(PKDPC Dpc, PVOID Unused, PVOID Request, PVOID Unused2) {
+	KeAcquireSpinLockAtDpcLevel(&s_IpcRequestPendingSpinLock);
 	// If there's pending async requests that were sent at DISPATCH_LEVEL,
 	// send one of them now.
 	if (!IsListEmpty(&s_IpcRequestPendingList)) {
-		HalpIpcSendOneRequestImpl(&s_IpcRequestPendingList);
+		HalpIpcSendOneRequestFromDpcLevel(&s_IpcRequestPendingList);
 	} else {
+		KeReleaseSpinLockFromDpcLevel(&s_IpcRequestPendingSpinLock);
 		// Raise the event, to allow another IPC request to be sent off.
 		KeSetEvent(&s_IpcSendReadyEvent, (KPRIORITY)0, FALSE);
 	}
@@ -168,7 +191,9 @@ static void HalpPxiRequestAck(PKDPC Dpc, PVOID Unused, PVOID Request, PVOID Unus
 
 // Allocate a request.
 static PIOS_IPC_REQUEST HalpIpcAlloc(void) {
+	KIRQL OldIrql = PxipAcquireSpinLock(&s_IpcMemorySpinLock);
 	PIOS_IPC_REQUEST Request = PhAlloc( &s_HalpPxiHeap, sizeof(IOS_IPC_REQUEST) );
+	PxipReleaseSpinLock(&s_IpcMemorySpinLock, OldIrql);
 	if (Request == NULL) {
 		return NULL;
 	}
@@ -178,7 +203,9 @@ static PIOS_IPC_REQUEST HalpIpcAlloc(void) {
 
 // Free a request.
 static void HalpIpcFree(PIOS_IPC_REQUEST Request) {
+	KIRQL OldIrql = PxipAcquireSpinLock(&s_IpcMemorySpinLock);
 	PhFree( &s_HalpPxiHeap, Request);
+	PxipReleaseSpinLock(&s_IpcMemorySpinLock, OldIrql);
 }
 
 // Allocate some buffers.
@@ -189,7 +216,9 @@ static PIOS_IPC_BUFFER HalpIpcBufferAlloc(PIOS_IPC_REQUEST Request, ULONG Count)
 		return RequestStatic->Ioctlv;
 	}
 	ULONG Size = Count * sizeof(IOS_IPC_BUFFER);
+	KIRQL OldIrql = PxipAcquireSpinLock(&s_IpcMemorySpinLock);
 	PIOS_IPC_BUFFER Buffers = PhAlloc( &s_HalpPxiHeap, Size );
+	PxipReleaseSpinLock(&s_IpcMemorySpinLock, OldIrql);
 	if (Buffers == NULL) {
 		return NULL;
 	}
@@ -200,14 +229,18 @@ static PIOS_IPC_BUFFER HalpIpcBufferAlloc(PIOS_IPC_REQUEST Request, ULONG Count)
 // Free some buffers.
 static void HalpIpcBufferFreeVirt(PIOS_IPC_REQUEST Request, PVOID Addr) {
 	if (Request->Flags & IPC_FLAG_STATIC) return;
+	KIRQL OldIrql = PxipAcquireSpinLock(&s_IpcMemorySpinLock);
 	PhFree( &s_HalpPxiHeap, Addr );
+	PxipReleaseSpinLock(&s_IpcMemorySpinLock, OldIrql);
 }
 
 static void HalpIpcBufferFree(PIOS_IPC_REQUEST Request, ULONG PhysAddr) {
 	if (Request->Flags & IPC_FLAG_STATIC) return;
 	PVOID Addr = HalpPxiPhysToVirt(PhysAddr);
 	if (Addr == NULL) return; // leaks some memory but what else can be done here?
+	KIRQL OldIrql = PxipAcquireSpinLock(&s_IpcMemorySpinLock);
 	PhFree( &s_HalpPxiHeap, Addr );
+	PxipReleaseSpinLock(&s_IpcMemorySpinLock, OldIrql);
 }
 
 void HalpInvalidateDcacheRange(PVOID Start, ULONG Length);
@@ -400,7 +433,7 @@ static void HalpIpcSendOneRequest(PIOS_IPC_REQUEST_ENTRY RequestEntry) {
 	}
 }
 
-static void HalpIpcSendOneRequestImpl(PLIST_ENTRY SendList) {
+static void HalpIpcSendOneRequestFromDpcLevel(PLIST_ENTRY SendList) {
 	// Grab the request to send.
 	PIOS_IPC_REQUEST_ENTRY RequestEntry = (PIOS_IPC_REQUEST_ENTRY) SendList->Flink;
 	
@@ -408,24 +441,11 @@ static void HalpIpcSendOneRequestImpl(PLIST_ENTRY SendList) {
 	
 	// Remove the request from the list
 	HalpPxiRemoveRequest(RequestEntry);
+	// Release the spinlock.
+	KeReleaseSpinLockFromDpcLevel(&s_IpcRequestPendingSpinLock);
 	// Send the request.
 	HalpIpcSendOneRequest(RequestEntry);
 }
-
-/*
-static void HalpIpcSendPendingRequests(PKDPC Dpc, PVOID Unused, PVOID Unused2, PVOID Unused3) {
-	// If a request can be sent:
-	ULONG DpcSendCount;
-	do {
-		// Wait until IOP is ready to handle a new request.
-		KeWaitForSingleObject( &s_IpcSendReadyEvent, Executive, KernelMode, FALSE, NULL);
-		// Send a pending request.
-		HalpIpcSendOneRequestImpl();
-		// Lower the count of requests to send.
-		DpcSendCount = InterlockedDecrement(&s_IpcDpcSendCount);
-	} while (DpcSendCount > 0);
-}
-*/
 
 // Sends a request.
 static void HalpIpcSendRequest(PIOS_IPC_REQUEST_ENTRY RequestEntry) {
@@ -462,6 +482,21 @@ static void HalpIpcSendRequest(PIOS_IPC_REQUEST_ENTRY RequestEntry) {
 		// not sure what to do here?
 		KeBugCheck(IRQL_NOT_LESS_OR_EQUAL);
 	}
+	
+	// Only CPU 0 can touch the device registers.
+	if (HALPCR->PhysicalProcessor != 0) {
+		// Running on CPU other than CPU0.
+		// Add to the pending list.
+		HalpPxiAddRequest(RequestEntry);
+		// Queue an ack DPC to CPU0, which will cause the pending request to be sent.
+		BOOLEAN AlreadyQueued = FALSE;
+		for (ULONG i = 0; i < IPC_REQUEST_COUNT; i++) {
+			AlreadyQueued = KeInsertQueueDpc(&s_DpcRequestAck[i], NULL, NULL);
+			if (AlreadyQueued) break;
+		}
+		if (!AlreadyQueued) KeBugCheckEx(NO_MORE_IRP_STACK_LOCATIONS, 0, 0, 0, 'HWD');
+		return;
+	}
 
 	// Send a pending request.
 	HalpIpcSendOneRequest(RequestEntry);
@@ -484,6 +519,7 @@ static NTSTATUS HalpPxiNewRequestImpl(IOS_OPERATION Op, IOS_HANDLE Handle, NTSTA
 	PIOS_IPC_REQUEST Request = HalpIpcAlloc();
 	if (Request == NULL) return STATUS_INSUFFICIENT_RESOURCES;
 	
+	Request->IpcVirt.Result = 0;
 	Request->IpcVirt.Operation = Op;
 	Request->IpcVirt.Handle = Handle;
 	Request->Status = Status;
@@ -556,7 +592,10 @@ static NTSTATUS HalpPxiPerformRequest(PIOS_IPC_REQUEST Request, BOOLEAN Synchron
 
 PVOID HalIopAlloc(ULONG Size) {
 	if (HalpPxiRegisters == NULL) return NULL;
+	
+	KIRQL OldIrql = PxipAcquireSpinLock(&s_IpcMemorySpinLock);
 	PVOID Buffer = PhAlloc( &s_HalpPxiHeap, Size );
+	PxipReleaseSpinLock(&s_IpcMemorySpinLock, OldIrql);
 	if (Buffer == NULL) {
 		return NULL;
 	}
@@ -565,7 +604,9 @@ PVOID HalIopAlloc(ULONG Size) {
 
 void HalIopFree(PVOID Buffer) {
 	if (HalpPxiRegisters == NULL) return;
-	return PhFree( &s_HalpPxiHeap, Buffer );
+	KIRQL OldIrql = PxipAcquireSpinLock(&s_IpcMemorySpinLock);
+	PhFree( &s_HalpPxiHeap, Buffer );
+	PxipReleaseSpinLock(&s_IpcMemorySpinLock, OldIrql);
 }
 
 static BOOLEAN HalpIopBufferAlignedForSwap(ULONG PhysAddr, ULONG Length) {
@@ -941,19 +982,24 @@ BOOLEAN HalpPxiInit(void) {
 	// Initialise the DPCs.
 	for (ULONG i = 0; i < IPC_REQUEST_COUNT; i++) {
 		KeInitializeDpc(&s_DpcRequestAck[i], HalpPxiRequestAck, NULL);
+		KeSetTargetProcessorDpc(&s_DpcRequestAck[i], 0);
 		KeInitializeDpc(&s_DpcResponseSent[i], HalpPxiResponseSent, NULL);
+		KeSetTargetProcessorDpc(&s_DpcRequestAck[i], 0);
 	}
 	//KeInitializeDpc(&s_DpcSendRequests, HalpIpcSendPendingRequests, NULL);
 	// Initialise the events for locking IPC send requests.
 	KeInitializeEvent(&s_IpcSendReadyEvent, SynchronizationEvent, TRUE);
 	KeInitializeEvent(&s_IpcSendPrepareEvent, SynchronizationEvent, TRUE);
-	// Initialise the pending requests linked list.
+	// Initialise the pending requests linked list, and its protective spinlock.
+	KeInitializeSpinLock(&s_IpcRequestPendingSpinLock);
 	InitializeListHead(&s_IpcRequestPendingList);
+	// Initialise other spinlocks.
+	KeInitializeSpinLock(&s_IpcMemorySpinLock);
 	// Map the PXI registers.
 	PHYSICAL_ADDRESS PxiPhysAddr;
 	PxiPhysAddr.HighPart = 0;
 	PxiPhysAddr.LowPart = PXI_REGISTER_BASE;
-	HalpPxiRegisters = (PPXI_REGISTERS) MmMapIoSpace( PxiPhysAddr, sizeof(*HalpPxiRegisters), MmNonCached);
+	HalpPxiRegisters = (PPXI_REGISTERS) MmMapIoSpace( PxiPhysAddr, PAGE_SIZE, MmNonCached);
 	if (HalpPxiRegisters == NULL) {
 		HalDisplayString("PXI: could not map MMIO\n");
 		return FALSE;
@@ -1013,6 +1059,7 @@ BOOLEAN HalpPxiInit(void) {
 		}
 		
 		// Set up the Vegas interrupt mask.
+		if (HalpSystemIsCafe()) MmioWriteBase32( MMIO_INTLT_OFFSET(Mask[1]), 0 );
 		VEGAS_INTERRUPT_MASK_SET( VEGAS_INTERRUPT_PXI );
 		// Handle any existing interrupts.
 		VEGAS_INTERRUPT_CLEAR( VEGAS_INTERRUPT_GPIO | VEGAS_INTERRUPT_PXI );

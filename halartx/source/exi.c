@@ -19,7 +19,8 @@ enum {
 	EXI_ASYNC_IMM,
 	EXI_ASYNC_IMMBUF,
 	EXI_ASYNC_IMMOUTBUF,
-	EXI_ASYNC_DMA
+	EXI_ASYNC_DMA,
+	EXI_ASYNC_FROMSYNC
 };
 
 typedef struct _EXI_ASYNC_WORK_ITEM {
@@ -255,6 +256,7 @@ static NTSTATUS ExipTransferImmediate(ULONG channel, ULONG data, ULONG length, E
 	
 	ExipEnableTransferCompleteInterrupt(channel, FALSE);
 
+	KIRQL OldIrql = HalpRaiseDeviceIrql(VECTOR_EXI);
 	// Start the transfer.
 	EXI_CHANNEL_TRANSFER_REGISTER Ctr;
 	Ctr.Value = 0;
@@ -268,7 +270,8 @@ static NTSTATUS ExipTransferImmediate(ULONG channel, ULONG data, ULONG length, E
 	do {
 		Ctr.Value = MmioReadBase32(MMIO_OFFSET(ExiRegisters, Channel[channel].Transfer));
 	} while (Ctr.Start);
-
+	KeLowerIrql(OldIrql);
+	
 	if (type != EXI_TRANSFER_WRITE) {
 		ULONG Ret = MmioReadBase32(MMIO_OFFSET(ExiRegisters, Channel[channel].Data));
 		Ret >>= (4 - length) * 8;
@@ -529,32 +532,6 @@ static void ExipAsyncTransferImmediateStart(ULONG channel, ULONG data, ULONG len
 	MmioWriteBase32(MMIO_OFFSET(ExiRegisters, Channel[channel].Transfer), Ctr.Value);
 }
 
-NTSTATUS HalExiTransferImmediateAsync(ULONG channel, ULONG data, ULONG length, EXI_TRANSFER_TYPE type, HAL_EXI_IMMASYNC_CALLBACK callback, PVOID context) {
-	if (callback == NULL) return STATUS_INVALID_PARAMETER_5;
-	if (channel >= EXI_CHANNEL_COUNT) return STATUS_INVALID_PARAMETER_1;
-	if (length > sizeof(ExiRegisters->Channel[0].Data)) return STATUS_INVALID_PARAMETER_3;
-
-	// Channel must be locked.
-	if (!HalExiLocked(channel)) return STATUS_INVALID_PARAMETER_1;
-	
-	// Ensure a device is selected.
-	if (!ExipDeviceSelected(channel)) return STATUS_INVALID_DEVICE_STATE;
-	
-	// Initialise the async descriptor.
-	PEXI_ASYNC_DESCRIPTOR AsyncDesc = &s_AsyncDesc[channel];
-	AsyncDesc->Type = EXI_ASYNC_IMM;
-	AsyncDesc->TransferType = type;
-	AsyncDesc->Part = 0;
-	AsyncDesc->BufferRead = NULL;
-	AsyncDesc->BufferWrite = NULL;
-	AsyncDesc->Length = length;
-	AsyncDesc->Callback.ImmAsync = callback;
-	AsyncDesc->Context = context;
-	
-	ExipAsyncTransferImmediateStart(channel, data, length, type);
-	return STATUS_PENDING;
-}
-
 static void ExipTransferImmediateBufferAsync(ULONG channel, PVOID bufferRead, PVOID bufferWrite, ULONG length, EXI_TRANSFER_TYPE type, HAL_EXI_ASYNC_CALLBACK callback, PVOID context, ULONG asyncType, ULONG partLength, EXI_SWAP_MODE swap) {
 	PUCHAR pRead = (PUCHAR)bufferRead;
 	PUCHAR pWrite = (PUCHAR)bufferWrite;
@@ -593,6 +570,33 @@ static void ExipTransferImmediateBufferAsync(ULONG channel, PVOID bufferRead, PV
 	ExipAsyncTransferImmediateStart(channel, thisData, thisLength, type);
 }
 
+#if FORCE_ASYNC // Use the slow async implementations even for small immediate (8-32 bits at a time) SPI transfers.
+NTSTATUS HalExiTransferImmediateAsync(ULONG channel, ULONG data, ULONG length, EXI_TRANSFER_TYPE type, HAL_EXI_IMMASYNC_CALLBACK callback, PVOID context) {
+	if (callback == NULL) return STATUS_INVALID_PARAMETER_5;
+	if (channel >= EXI_CHANNEL_COUNT) return STATUS_INVALID_PARAMETER_1;
+	if (length > sizeof(ExiRegisters->Channel[0].Data)) return STATUS_INVALID_PARAMETER_3;
+
+	// Channel must be locked.
+	if (!HalExiLocked(channel)) return STATUS_INVALID_PARAMETER_1;
+	
+	// Ensure a device is selected.
+	if (!ExipDeviceSelected(channel)) return STATUS_INVALID_DEVICE_STATE;
+	
+	// Initialise the async descriptor.
+	PEXI_ASYNC_DESCRIPTOR AsyncDesc = &s_AsyncDesc[channel];
+	AsyncDesc->Type = EXI_ASYNC_IMM;
+	AsyncDesc->TransferType = type;
+	AsyncDesc->Part = 0;
+	AsyncDesc->BufferRead = NULL;
+	AsyncDesc->BufferWrite = NULL;
+	AsyncDesc->Length = length;
+	AsyncDesc->Callback.ImmAsync = callback;
+	AsyncDesc->Context = context;
+	
+	ExipAsyncTransferImmediateStart(channel, data, length, type);
+	return STATUS_PENDING;
+}
+
 NTSTATUS HalExiTransferImmediateBufferAsync(ULONG channel, PVOID bufferRead, PVOID bufferWrite, ULONG length, EXI_TRANSFER_TYPE type, HAL_EXI_ASYNC_CALLBACK callback, PVOID context) {
 	PUCHAR pRead = (PUCHAR)bufferRead;
 	PUCHAR pWrite = (PUCHAR)bufferWrite;
@@ -628,6 +632,91 @@ NTSTATUS HalExiReadWriteImmediateOutBufferAsync(ULONG channel, UCHAR byteRead, P
 	ExipTransferImmediateBufferAsync(channel, (PVOID)wordRead, buffer, length, EXI_TRANSFER_READWRITE, callback, context, EXI_ASYNC_IMMOUTBUF, 0, EXI_SWAP_NONE);
 	return STATUS_PENDING;
 }
+#else // Use faster synchronous implementations for small transfers even if caller wants them async.
+
+static void ExipSyncToAsyncCallbackImm(ULONG channel, ULONG data, HAL_EXI_IMMASYNC_CALLBACK callback, PVOID context) {
+	PEXI_ASYNC_DESCRIPTOR AsyncDesc = &s_AsyncDesc[channel];
+	
+	if (AsyncDesc->Type == EXI_ASYNC_NONE) {
+		// first callback
+		AsyncDesc->Type = EXI_ASYNC_FROMSYNC;
+		AsyncDesc->Part = 0;
+		ULONG CurrentPart = 0;
+		// Call the initial callback.
+		callback(channel, data, context);
+		// Make sure it didn't start an async DMA.
+		if (AsyncDesc->Type != EXI_ASYNC_FROMSYNC) return;
+		while (CurrentPart != AsyncDesc->Part) {
+			CurrentPart = AsyncDesc->Part;
+			AsyncDesc->Callback.ImmAsync(channel, AsyncDesc->PartLength, AsyncDesc->Context);
+			// Make sure it didn't start an async DMA.
+			if (AsyncDesc->Type != EXI_ASYNC_FROMSYNC) return;
+		}
+		// Finished.
+		AsyncDesc->Type = EXI_ASYNC_NONE;
+	} else if (AsyncDesc->Type == EXI_ASYNC_FROMSYNC) {
+		// inside a previous callback.
+		// save off the data, and use it later.
+		AsyncDesc->Part++;
+		AsyncDesc->Callback.ImmAsync = callback;
+		AsyncDesc->Context = context;
+		AsyncDesc->PartLength = data;
+	} else {
+		// shouldn't happen, just call the callback
+		callback(channel, data, context);
+	}
+}
+
+static void ExipSyncToAsyncCallback(ULONG channel, HAL_EXI_ASYNC_CALLBACK callback, PVOID context) {
+	PEXI_ASYNC_DESCRIPTOR AsyncDesc = &s_AsyncDesc[channel];
+	
+	if (AsyncDesc->Type == EXI_ASYNC_NONE) {
+		// first callback
+		AsyncDesc->Type = EXI_ASYNC_FROMSYNC;
+		AsyncDesc->Part = 0;
+		ULONG CurrentPart = 0;
+		// Call the initial callback.
+		callback(channel, context);
+		// Make sure it didn't start an async DMA.
+		if (AsyncDesc->Type != EXI_ASYNC_FROMSYNC) return;
+		while (CurrentPart != AsyncDesc->Part) {
+			CurrentPart = AsyncDesc->Part;
+			AsyncDesc->Callback.Async(channel, AsyncDesc->Context);
+			// Make sure it didn't start an async DMA.
+			if (AsyncDesc->Type != EXI_ASYNC_FROMSYNC) return;
+		}
+		// Finished.
+		AsyncDesc->Type = EXI_ASYNC_NONE;
+	} else if (AsyncDesc->Type == EXI_ASYNC_FROMSYNC) {
+		// inside a previous callback.
+		AsyncDesc->Part++;
+		AsyncDesc->Callback.Async = callback;
+		AsyncDesc->Context = context;
+	} else {
+		// shouldn't happen, just call the callback
+		callback(channel, context);
+	}
+}
+
+NTSTATUS HalExiTransferImmediateAsync(ULONG channel, ULONG data, ULONG length, EXI_TRANSFER_TYPE type, HAL_EXI_IMMASYNC_CALLBACK callback, PVOID context) {
+	ULONG dataRead = 0;
+	NTSTATUS Status = HalExiTransferImmediate(channel, data, length, type, &dataRead);
+	if (NT_SUCCESS(Status)) ExipSyncToAsyncCallbackImm(channel, data, callback, context);
+	return Status;
+}
+
+NTSTATUS HalExiTransferImmediateBufferAsync(ULONG channel, PVOID bufferRead, PVOID bufferWrite, ULONG length, EXI_TRANSFER_TYPE type, HAL_EXI_ASYNC_CALLBACK callback, PVOID context) {
+	NTSTATUS Status = HalExiTransferImmediateBuffer(channel, bufferRead, bufferWrite, length, type);
+	if (NT_SUCCESS(Status)) ExipSyncToAsyncCallback(channel, callback, context);
+	return Status;
+}
+
+NTSTATUS HalExiReadWriteImmediateOutBufferAsync(ULONG channel, UCHAR byteRead, PVOID buffer, ULONG length, HAL_EXI_ASYNC_CALLBACK callback, PVOID context) {
+	NTSTATUS Status = HalExiReadWriteImmediateOutBuffer(channel, byteRead, buffer, length);
+	if (NT_SUCCESS(Status)) ExipSyncToAsyncCallback(channel, callback, context);
+	return Status;
+}
+#endif
 
 static void ExipTransferDmaAsync(ULONG channel, PVOID buffer, ULONG totalLength, EXI_TRANSFER_TYPE type, EXI_SWAP_MODE swap, HAL_EXI_ASYNC_CALLBACK callback, ULONG length) {
 	PEXI_ASYNC_DESCRIPTOR AsyncDesc = &s_AsyncDesc[channel];

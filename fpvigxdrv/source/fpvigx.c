@@ -20,6 +20,7 @@
 #define _NTOSDEF_ 1 // we want internal video.h, because we basically are
 #include <video.h>
 #include <winerror.h>
+#define KIPCR 0xffffd000
 
 extern ULONG NtBuildNumber;
 
@@ -789,6 +790,9 @@ VP_STATUS ViFindAdapter(PVOID HwDeviceExtension, PVOID HwContext, PWSTR Argument
 	if ((ULONG)RUNTIME_BLOCK < 0x80000000) return ERROR_DEV_NOT_EXIST;
 	if ((ULONG)RUNTIME_BLOCK >= 0x90000000) return ERROR_DEV_NOT_EXIST;
 	
+	// If this is Cafe, this device is not enabled.
+	if (RUNTIME_BLOCK[RUNTIME_SYSTEM_TYPE] >= ARTX_SYSTEM_LATTE) return ERROR_DEV_NOT_EXIST;
+	
 	// Grab the framebuffer config and check that it's not NULL and sane.
 	PFRAME_BUFFER FbConfig = RUNTIME_BLOCK[RUNTIME_FRAME_BUFFER];
 	if ((ULONG)FbConfig == 0) return ERROR_DEV_NOT_EXIST;
@@ -878,7 +882,12 @@ VP_STATUS ViFindAdapter(PVOID HwDeviceExtension, PVOID HwContext, PWSTR Argument
 	ConfigInfo->BusInterruptLevel = 1;
 	
 	// Enable the command processor FIFO.
-	CppFifoEnable();
+	// This must be done on CPU 0.
+	{
+		KAFFINITY OldAffinity = KeSetAffinityThread(PsGetCurrentThread(), 1);
+		CppFifoEnable();
+		KeSetAffinityThread(PsGetCurrentThread(), OldAffinity);
+	}
 	
 	// If setupdd is loaded, we need to set up a framebuffer copy in main memory.
 	// We'll use only 640x480x32 for this.
@@ -923,6 +932,7 @@ VP_STATUS ViFindAdapter(PVOID HwDeviceExtension, PVOID HwContext, PWSTR Argument
 		if (SetupddLoaded) {
 			// Also initialise the timer and DPC.
 			KeInitializeDpc(&Extension->TimerDpc, FbpTimerCallback, Extension);
+			KeSetTargetProcessorDpc(&Extension->TimerDpc, 0);
 			KeInitializeTimer(&Extension->Timer);
 		} else {
 			// Allocate and map the bank buffer. Must be used uncached here as the physical page will get mapped elsewhere as uncached.
@@ -1058,6 +1068,9 @@ BOOLEAN ViInitialise(PVOID HwDeviceExtension) {
 	// Initialisation for after we get control of VI from the HAL.
 	
 	PDEVICE_EXTENSION Extension = (PDEVICE_EXTENSION)HwDeviceExtension;
+	
+	// This code must run on CPU 0.
+	KAFFINITY OldAffinity = KeSetAffinityThread(PsGetCurrentThread(), 1);
 
 	// Clear the GPU interrupt and the CP interrupt.
 	PE_FINISHED_CLEAR();
@@ -1106,6 +1119,9 @@ BOOLEAN ViInitialise(PVOID HwDeviceExtension) {
 		FbpStartTimer(Extension);
 	}
 #endif
+	
+	// Switch affinity back to what it was.
+	KeSetAffinityThread(PsGetCurrentThread(), OldAffinity);
 	return TRUE;
 }
 
@@ -1449,12 +1465,21 @@ VP_STATUS ViStartIoImpl(PDEVICE_EXTENSION Extension, PVIDEO_REQUEST_PACKET Reque
 }
 
 BOOLEAN ViStartIo(PVOID HwDeviceExtension, PVIDEO_REQUEST_PACKET RequestPacket) {
+	// This code must run on CPU 0.
+	KAFFINITY OldAffinity = KeSetAffinityThread(PsGetCurrentThread(), 1);
+	
 	PDEVICE_EXTENSION Extension = (PDEVICE_EXTENSION)HwDeviceExtension;
 	RequestPacket->StatusBlock->Status = ViStartIoImpl(Extension, RequestPacket);
+	
+	// Switch affinity back to what it was.
+	KeSetAffinityThread(PsGetCurrentThread(), OldAffinity);
 	return TRUE;
 }
 
 NTSTATUS DriverEntry(PVOID DriverObject, PVOID RegistryPath) {
+	// This code must run on CPU 0.
+	KAFFINITY OldAffinity = KeSetAffinityThread(PsGetCurrentThread(), 1);
+	
 	VIDEO_HW_INITIALIZATION_DATA InitData;
 	RtlZeroMemory(&InitData, sizeof(InitData));
 	
@@ -1471,5 +1496,8 @@ NTSTATUS DriverEntry(PVOID DriverObject, PVOID RegistryPath) {
 	// Our HAL(s) configure VMEBus to be equal to Internal, nothing else uses it.
 	InitData.AdapterInterfaceType = VMEBus;
 	NTSTATUS Status = VideoPortInitialize(DriverObject, RegistryPath, &InitData, NULL);
+	
+	// Switch affinity back to what it was.
+	KeSetAffinityThread(PsGetCurrentThread(), OldAffinity);
 	return Status;
 }

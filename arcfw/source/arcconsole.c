@@ -32,7 +32,7 @@ typedef struct _console_data_s {
 } console_data_s;
 
 //color table
-static const unsigned int color_table[] =
+static const unsigned int color_table_yuv[] =
 {
   0x10801080,		// 30 normal black
   0x316D31B8,		// 31 normal red
@@ -52,9 +52,33 @@ static const unsigned int color_table[] =
   0xEB80EB80,		// 37 bright white
 };
 
+static const unsigned int color_table_rgb[] =
+{
+  0x00000000,		// 30 normal black
+  0x00aa0000,		// 31 normal red
+  0x0000aa00,		// 32 normal green
+  0x00aaaa00,		// 33 normal yellow
+  0x000000aa,		// 34 normal blue
+  0x00aa00aa,		// 35 normal magenta
+  0x0000aaaa,		// 36 normal cyan
+  0x00aaaaaa,		// 37 normal white
+  0x00555555,		// 30 bright black
+  0x00ff5555,		// 31 bright red
+  0x0055ff55,		// 32 bright green
+  0x00ffff55,		// 33 bright yellow
+  0x005555ff,		// 34 bright blue
+  0x00ff55ff,		// 35 bright magenta
+  0x0055ffff,		// 36 bright cyan
+  0x00ffffff,		// 37 bright white
+};
+
 static struct _console_data_s stdcon;
 static struct _console_data_s* curr_con = NULL;
 ULONG g_framebuffer_phys = 0;
+
+static bool s_is_rgb = false;
+
+#define color_table (s_is_rgb ? color_table_rgb : color_table_yuv)
 
 extern u8 console_font_8x16[];
 
@@ -73,12 +97,15 @@ static void __console_drawc(int c)
 	if (!curr_con) return;
 	con = curr_con;
 
-	ptr = (unsigned int*)(
-		con->destbuffer + 
-			(con->con_stride * con->cursor_row * FONT_YSIZE) + 
+	if (s_is_rgb) ptr = (unsigned int*)(con->destbuffer + (con->con_stride * con->cursor_row * FONT_YSIZE) + ((con->cursor_col * FONT_XSIZE) * 4));
+	else {
+		ptr = (unsigned int*)(
+			con->destbuffer +
+			(con->con_stride * con->cursor_row * FONT_YSIZE) +
 			((con->cursor_col * FONT_XSIZE / 2) * 4) +
 			(con->target_y * con->con_stride) + (con->target_x * 2)
-	);
+			);
+	}
 	pbits = &con->font[c * FONT_YSIZE];
 	nextline = con->con_stride;
 	fgcolor = con->real_foreground;
@@ -94,6 +121,14 @@ static void __console_drawc(int c)
 		color = 0;
 
 #define PLOT_FLAG(x) do {\
+	if (s_is_rgb) {\
+		if (bits & (x)) color = fgcolor;\
+		else color = bgcolor;\
+		*ptr = color;\
+		/* NativeWrite32(ptr, color); */\
+		ptr++;\
+		break;\
+	}\
 	unsigned int mask = 0xFFFF00FF;\
 	if ((x) & 0x55) mask = 0x0000FF00;\
 	if (bits & (x)) color |= fgcolor & mask;\
@@ -101,6 +136,7 @@ static void __console_drawc(int c)
 } while (0)
 
 #define WRITE_FB() do {\
+	if (s_is_rgb) break;\
 	NativeWrite32(ptr, color);\
 	ptr++;\
 	color = 0;\
@@ -207,6 +243,10 @@ static void __console_clear_to_cursor(void) {
 
 	while (cur_row--)
 		__console_clear_line(cur_row, 0, con->con_cols);
+}
+
+void ArcConsoleUseRgb(void) {
+	s_is_rgb = true;
 }
 
 void ArcConsoleInit(void* framebuffer, int xstart, int ystart, int xres, int yres, int stride)
