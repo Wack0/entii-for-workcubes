@@ -50,10 +50,8 @@ jobs:
       if: steps.cache-libc.outputs.cache-hit != 'true'
       run: |
         cd ..
-        wget -nv https://repo-de.voidlinux.org/current/cross-powerpcle-linux-gnu-0.34_1.x86_64.xbps
-        zstdcat cross-powerpcle-linux-gnu-0.34_1.x86_64.xbps -o cross-powerpcle-linux-gnu-0.34_1.x86_64.tar
-        tar -xf cross-powerpcle-linux-gnu-0.34_1.x86_64.tar
-        cp usr/lib/gcc/powerpcle-linux-gnu/10.2/libgcc.a entii-for-workcubes/arcfw/gccle/
+        wget -nv https://github.com/stonedDiscord/entii-for-workcubes/releases/download/libgcc/libgcc.a
+        mv libgcc.a entii-for-workcubes/arcfw/gccle/
         
     - name: Build ARC Firmware
       run: |
