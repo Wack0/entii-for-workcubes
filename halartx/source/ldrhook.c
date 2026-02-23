@@ -144,21 +144,9 @@ static BOOLEAN FindLengthOfCodeTable(ULONG ImageBase, PIMAGE_SECTION_HEADER Sect
 	*TextCaveRva = 0;
 	*TextCaveLength = 0;
 	if (FirstCodeSection != NumberOfSections) {
-		PULONG SectionStart = (PULONG)(ULONG)(ImageBase + Sections[FirstCodeSection].VirtualAddress);
-		PULONG SectionPtr = (PULONG)(ULONG)(ImageBase + Sections[FirstCodeSection].VirtualAddress + Sections[FirstCodeSection].SizeOfRawData - sizeof(ULONG));
 		ULONG SizeOfCave = 0;
-		while (SectionPtr > SectionStart) {
-			if (*SectionPtr != 0) break;
-			// If the byte before this 32-bit value isn't zero, then stop here to prevent overwriting any null terminator.
-			if (SectionPtr[-1] != 0) {
-				PUCHAR SectionPtr8 = (PUCHAR)SectionPtr;
-				if (SectionPtr8[-1] != 0) {
-					break;
-				}
-			}
-			SizeOfCave += sizeof(*SectionPtr);
-			SectionPtr--;
-		}
+		if (ARC_ALIGNUP(Sections[FirstCodeSection].Misc.VirtualSize, 4) < Sections[FirstCodeSection].SizeOfRawData)
+			SizeOfCave = Sections[FirstCodeSection].SizeOfRawData - ARC_ALIGNUP(Sections[FirstCodeSection].Misc.VirtualSize, 4);
 		*TextCaveLength = SizeOfCave;
 		*TextCaveRva = Sections[FirstCodeSection].VirtualAddress + Sections[FirstCodeSection].SizeOfRawData - SizeOfCave;
 	}
@@ -466,6 +454,21 @@ typedef ULONG (*tfpRtlVirtualUnwind)(
 
 typedef PVOID (*tfpRtlPcToFileHeader)(ULONG Address, PVOID BaseAddress);
 
+typedef void (*tfpKeSweepDcache)(BOOLEAN AllProcessors);
+typedef void (*tfpKeSweepIcache)(BOOLEAN AllProcessors);
+typedef void (*tfpKeSweepIcacheRange)(BOOLEAN AllProcessors, PVOID BaseAddress, ULONG Length);
+
+typedef void (*tfpKeFlushIoBuffers)(PMDL Mdl, BOOLEAN Read, BOOLEAN Dma);
+
+typedef void (*PIPI_CALLBACK)(PVOID Context, PVOID Arg1, PVOID Arg2, PVOID Arg3);
+
+typedef void (*tfpKiIpiSendPacket)(KAFFINITY TargetProcessors, PIPI_CALLBACK Callback, PVOID Arg1, PVOID Arg2, PVOID Arg3);
+typedef void (*tfpKiIpiSignalPacketDone)(PVOID Context);
+typedef void (*tfpKiIpiStallOnPacketTargets)(void);
+
+
+typedef void (*tfpKeBugCheckEx)(ULONG BugcheckCode, ULONG Arg1, ULONG Arg2, ULONG Arg3, ULONG Arg4);
+
 #define DEFINE_ORIG(name) static AIXCALL_FPTR fporig_##name; static tfp##name orig_##name = (tfp##name)&fporig_##name
 DEFINE_ORIG(ObCreateObject);
 //DEFINE_ORIG(ObReferenceObjectByPointer);
@@ -477,6 +480,15 @@ DEFINE_ORIG(IoPageRead);
 DEFINE_ORIG(FsRtlGetFileSize);
 DEFINE_ORIG(MmPageEntireDriver);
 DEFINE_ORIG(RtlVirtualUnwind);
+DEFINE_ORIG(KeSweepDcache);
+DEFINE_ORIG(KeSweepIcache);
+DEFINE_ORIG(KeSweepIcacheRange);
+DEFINE_ORIG(KeFlushIoBuffers);
+DEFINE_ORIG(KiIpiSendPacket);
+DEFINE_ORIG(KiIpiSignalPacketDone);
+DEFINE_ORIG(KiIpiStallOnPacketTargets);
+
+DEFINE_ORIG(KeBugCheckEx);
 
 static AIXCALL_FPTR fp_RtlPcToFileHeader;
 static tfpRtlPcToFileHeader RtlPcToFileHeader = (tfpRtlPcToFileHeader)&fp_RtlPcToFileHeader;
@@ -664,6 +676,13 @@ hook_MmCreateSection(
 		PATCH_ENTRY_SECTION(Section) = PatchEntry;
 		// And write it to the caller's pointer.
 		*SectionObject = Section;
+		
+#if 0
+		char Buffer[1024];
+		PUNICODE_STRING FileName = (PUNICODE_STRING) ((ULONG) File + 0x30);
+		_snprintf(Buffer, sizeof(Buffer), "Loading %wZ\n", FileName);
+		HalDisplayString(Buffer);
+#endif
 
 		// Can't do anything more until something maps it.
 		// Return success.
@@ -729,6 +748,9 @@ hook_MmMapViewInSystemSpace(
 	return STATUS_UNSUCCESSFUL;
 }
 
+void HalSweepAllDcache(void);
+void HalSyncBeforeExecution(PVOID BaseAddress, ULONG Length);
+
 NTSTATUS
 hook_IoPageRead(
 	IN PVOID FileObject,
@@ -782,7 +804,7 @@ hook_IoPageRead(
 
 		// Copy to MDL
 		memcpy(Mapped, &Section[OffsetStart], Length);
-		sync_before_exec(Mapped, Length);
+		HalSyncBeforeExecution(Mapped, Length);
 		
 		// Fill in the IoStatusBlock
 		IoStatusBlock->Status = STATUS_SUCCESS;
@@ -821,7 +843,7 @@ hook_IoPageRead(
 
 		// Copy to MDL
 		memcpy(Mapped, &Section[InjectedOffset], CopyLength);
-		sync_before_exec(Mapped, Length);
+		HalSyncBeforeExecution(Mapped, Length);
 		// Fill in the IoStatusBlock
 		IoStatusBlock->Status = STATUS_SUCCESS;
 		IoStatusBlock->Information = CopyLength;
@@ -855,7 +877,7 @@ hook_IoPageRead(
 		ULONG CopyLength = PatchEntry->SizeOfHeaders - OffsetStart;
 		if (CopyLength > Length) CopyLength = Length;
 		memcpy(Mapped, &Section[OffsetStart], CopyLength);
-		sync_before_exec(Mapped, CopyLength);
+		//sync_before_exec(Mapped, CopyLength);
 		// Fill in the IoStatusBlock
 		IoStatusBlock->Status = STATUS_SUCCESS;
 		IoStatusBlock->Information = CopyLength;
@@ -925,7 +947,7 @@ hook_IoPageRead(
 				ULONG IosbLength = Iosb.Information;
 				if (IosbLength > ReadLength32) IosbLength = ReadLength32;
 				memcpy(&Mapped[MemOffset], ReadBuffer, IosbLength);
-				sync_before_exec(&Mapped[MemOffset], IosbLength);
+				//sync_before_exec(&Mapped[MemOffset], IosbLength);
 				ReadLength32 -= IosbLength;
 
 				MemOffset += IosbLength;
@@ -982,7 +1004,7 @@ hook_IoPageRead(
 
 		// Copy to MDL
 		memcpy(&Mapped[MemOffset], &Section[PatchSection->OurOffset + SectionOffset], LengthToCopy);
-		sync_before_exec(&Mapped[MemOffset], LengthToCopy);
+		//sync_before_exec(&Mapped[MemOffset], LengthToCopy);
 		// Fill in the IoStatusBlock
 		IoStatusBlock->Information += LengthToCopy;
 
@@ -994,7 +1016,7 @@ hook_IoPageRead(
 		// Zero out the part requiring that
 		if (LengthToZero != 0) {
 			memset(&Mapped[MemOffset], 0, LengthToZero);
-			sync_before_exec(&Mapped[MemOffset], LengthToZero);
+			//sync_before_exec(&Mapped[MemOffset], LengthToZero);
 
 			// Fix up the offsets
 			MemOffset += LengthToZero;
@@ -1046,7 +1068,7 @@ hook_IoPageRead(
 					ULONG IosbLength = Iosb.Information;
 					if (IosbLength > ReadLength32) IosbLength = ReadLength32;
 					memcpy(&Mapped[MemOffset], ReadBuffer, IosbLength);
-					sync_before_exec(&Mapped[MemOffset], IosbLength);
+					//sync_before_exec(&Mapped[MemOffset], IosbLength);
 					ReadLength32 -= IosbLength;
 
 					MemOffset += IosbLength;
@@ -1081,7 +1103,7 @@ hook_IoPageRead(
 
 			// Copy to MDL
 			memcpy(&Mapped[MemOffset], &Section[SectionOffset], LengthToCopy);
-			sync_before_exec(&Mapped[MemOffset], LengthToCopy);
+			//sync_before_exec(&Mapped[MemOffset], LengthToCopy);
 			// Fill in the IoStatusBlock
 			IoStatusBlock->Information += LengthToCopy;
 
@@ -1096,11 +1118,12 @@ hook_IoPageRead(
 		} while (FALSE);
 	}
 
-
 	// Free MDL
 	IoFreeMdl(MdlReadBuffer);
 	// Free read buffer
 	ExFreePool(Kevent);
+	
+	HalSyncBeforeExecution(Mapped, IoStatusBlock->Information);
 
 	// Set the event we were passed in on success
 	if (NT_SUCCESS(Status)) KeSetEvent(Event, 0, FALSE);
@@ -1129,6 +1152,12 @@ static PIMAGE_SECTION_HEADER SectionContainingRva(PIMAGE_SECTION_HEADER Sections
 	return NULL;
 }
 
+static ULONG LhpRead32(PULONG Ptr) {
+	ULONG Ret = *(ULONG volatile *)Ptr;
+	asm volatile("");
+	return Ret;
+}
+
 NTSTATUS hook_FsRtlGetFileSize(PVOID FileObject, PLARGE_INTEGER FileSize) {
 	// Getting the file size. Need to increase the file size for MiCreateImageFileMap.
 	// Also save off various file offsets to be used later.
@@ -1140,6 +1169,11 @@ NTSTATUS hook_FsRtlGetFileSize(PVOID FileObject, PLARGE_INTEGER FileSize) {
 		// If there's already a created section object, then we've already performed the operation.
 		if (PatchEntry->BaseSectionObject != NULL) {
 			PatchEntry = NULL;
+		} else {
+			// Make sure the caller is MiCreateImageFileMap.
+			// This also matches MiCreateDataFileMap, but that will never be called for an image section.
+			PULONG Insn = *(PULONG*)(__builtin_frame_address(2) + 8);
+			if ((LhpRead32(&Insn[2]) & 0xFFFF) != 0xC000 || (LhpRead32(&Insn[3]) & 0xFFFF) != 0x00BA) PatchEntry = NULL;
 		}
 	}
 
@@ -1824,6 +1858,8 @@ NTSTATUS hook_FsRtlGetFileSize(PVOID FileObject, PLARGE_INTEGER FileSize) {
 		// Free the bitmap buffer.
 		ExFreePool(BitmapBuffer);
 		// All done with the final section and the base section.
+		sync_before_exec(pFinalSection, MappedSize);
+		sync_before_exec(pBaseSection, SectionSize32);
 		MmUnmapViewInSystemSpace(pFinalSection);
 		MmUnmapViewInSystemSpace(pBaseSection);
 
@@ -1896,6 +1932,113 @@ static ULONG hook_RtlVirtualUnwind(
 	}
 	
 	return Caller;
+}
+
+static void hook_KeSweepDcache(BOOLEAN AllProcessors) {
+	// Sweep dcache on this CPU, then return original function to do it on other CPUs if needed.
+	// Do it on this CPU first to avoid potential CIU paradoxes.
+	// Raise to dispatch level first to prevent any context switches.
+	KIRQL OldIrql;
+	KeRaiseIrql(DISPATCH_LEVEL, &OldIrql);
+	HalSweepDcache();
+	//HalSweepIcache(); // now we know which is which :)
+	if (AllProcessors) orig_KeSweepDcache(TRUE);
+	KeLowerIrql(OldIrql);
+}
+
+static void hook_KeSweepIcache(BOOLEAN AllProcessors) {
+	// Sweep dcache and icache on this CPU, then return original function to do it on other CPUs.
+	// Do both because we do not know which of KeSweepDcache/KeSweepIcache is which, and KeSweepIcache sweeps both anyway.
+	// Do it on this CPU first to avoid potential CIU paradoxes.
+	// Raise to dispatch level first to prevent any context switches.
+	KIRQL OldIrql;
+	KeRaiseIrql(DISPATCH_LEVEL, &OldIrql);
+	HalSweepDcache();
+	HalSweepIcache();
+	orig_KeSweepIcache(TRUE); // always sweep on all processors.
+	KeLowerIrql(OldIrql);
+}
+
+static void LhpSweepIcacheRangeCb(PVOID Context, PVOID BaseAddress, PVOID Length, PVOID Unused) {
+	(void)Unused;
+	
+	ULONG a = (ULONG)BaseAddress & ~0x1f;
+	ULONG b = ((ULONG)BaseAddress + (ULONG)Length + 0x1f) & ~0x1f;
+	
+	HalSweepIcacheRange((PVOID)a, b - (ULONG)a);
+	orig_KiIpiSignalPacketDone(Context);
+}
+
+static void hook_KeFlushIoBuffers(PMDL Mdl, BOOLEAN Read, BOOLEAN Dma) {
+	if ((!Dma || Read) && (Mdl->MdlFlags & MDL_IO_PAGE_READ) == 0) {
+		orig_KeFlushIoBuffers(Mdl, Read, Dma);
+		return;
+	}
+	
+	// Sweep dcache and icache on this CPU, then return original function to do it on other CPUs.
+	KIRQL OldIrql;
+	KeRaiseIrql(DISPATCH_LEVEL, &OldIrql);
+	HalSweepDcache();
+	HalSweepIcache();
+	orig_KeFlushIoBuffers(Mdl, Read, Dma); // always sweep on all processors.
+	KeLowerIrql(OldIrql);
+}
+
+// Export for allowing something that isn't kernel to sweep the dcache on all CPUs.
+void HalSweepAllDcache(void) {
+	if (fporig_KeSweepDcache.Function == 0) {
+		KIRQL OldIrql;
+		KeRaiseIrql(DISPATCH_LEVEL, &OldIrql);
+		HalSweepDcache();
+		KeLowerIrql(OldIrql);
+		return;
+	}
+	
+	// Unknown which is which. It doesn't matter, as dcache gets sweeped by both.
+	hook_KeSweepDcache(TRUE);
+}
+
+// Export for allowing something that isn't kernel to flush dcache range on current CPU and invalidate icache on all CPUs.
+void HalSyncBeforeExecution(PVOID BaseAddress, ULONG Length) {
+	if (fporig_KiIpiSendPacket.Function == 0) {
+		// Flush dcache and invalidate icache on this processor. Do nothing else.
+		sync_before_exec(BaseAddress, Length);
+		return;
+	}
+	
+	KIRQL OldIrql;
+	KeRaiseIrql(DISPATCH_LEVEL, &OldIrql);
+	
+	// Flush dcache and invalidate icache on this processor.
+	sync_before_exec(BaseAddress, Length);
+	
+	// Assume all processors are up - if one didn't come up then a bugcheck would have occured
+	ULONG TargetProcessors = ((1 << *KeNumberProcessors) - 1) & PCR->NotMember;
+	if (TargetProcessors != 0) {
+		orig_KiIpiSendPacket(TargetProcessors, LhpSweepIcacheRangeCb, BaseAddress, (PVOID)Length, NULL);
+		orig_KiIpiStallOnPacketTargets();
+	}
+	
+	KeLowerIrql(OldIrql);
+}
+
+static void hook_KeSweepIcacheRange(BOOLEAN AllProcessors, PVOID BaseAddress, ULONG Length) {
+	// Instruction cache of Espresso cores are not coherent.
+	(void)AllProcessors;
+	return HalSyncBeforeExecution(BaseAddress, Length);
+}
+
+static void hook_KeBugCheckEx(ULONG BugcheckCode, ULONG Arg1, ULONG Arg2, ULONG Arg3, ULONG Arg4) {
+	if (BugcheckCode == KMODE_EXCEPTION_NOT_HANDLED && Arg1 == STATUS_ILLEGAL_INSTRUCTION) {
+		// Try to save ourselves.
+		if (*(PULONG)((ULONG)PCR + 0xFFC) != Arg2) {
+			*(PULONG)((ULONG)PCR + 0xFFC) = Arg2;
+			HalSweepIcache();
+			return;
+		}
+	}
+	orig_KeBugCheckEx(BugcheckCode, Arg1, Arg2, Arg3, Arg4);
+	while (TRUE);
 }
 
 // Hook engine.
@@ -2361,6 +2504,243 @@ BOOLEAN HalpHookKernelPeLoader(PVOID ImageBase) {
 
 	if (fporig_MiLoadImageSection.Function == 0) return FALSE;
 #endif
+
+	// KeSweepDcache and KeSweepIcache are not exported but are guaranteed to be after KeFlushEntireTb
+	PVOID KeFlushEntireTb = PeGetProcAddress(ImageBase, Export, "KeFlushEntireTb");
+    if (KeFlushEntireTb == NULL) return FALSE;
+
+    fporig_KeSweepDcache.Function = 0;
+	fporig_KeSweepIcache.Function = 0;
+	fporig_KeSweepDcache.Toc = (ULONG)KernelToc;
+	fporig_KeSweepIcache.Toc = (ULONG)KernelToc;
+    FuncStart = KeFlushEntireTb;
+    FuncEnd = FindSymbolNextStart((ULONG)ImageBase, Exceptions, ExceptionDir->Size, FuncStart);
+	
+	PVOID KeSweepIcacheRange = NULL;
+	PVOID KeSweepFirst = NULL;
+	PVOID KeSweepSecond = NULL;
+	
+	PPPC_INSTRUCTION KeSweepFirstInsn = NULL;
+	PPPC_INSTRUCTION KeSweepSecondInsn = NULL;
+	
+	// First, get KeSweepIcacheRange. That uses a different pattern.
+	while (TRUE) {
+        // Get the next function
+        FuncStart = FuncEnd;
+        FuncEnd = FindSymbolNextStart((ULONG)ImageBase, Exceptions, ExceptionDir->Size, FuncStart);
+        if (FuncEnd == NULL) break;
+
+        BOOLEAN InsnFound = FALSE;
+        for (PPPC_INSTRUCTION Insn = (PPPC_INSTRUCTION)FuncStart; Insn < (PPPC_INSTRUCTION)FuncEnd; Insn++) {
+            PPC_INSTRUCTION Insn2;
+            Insn2.Long = Insn->Long;
+            // lwz ..., 0xD48C(x)
+            if (Insn2.Primary_Op != LWZ_OP) continue;
+            if ((Insn2.Long & 0xFFFF) != 0xD48C) continue;
+
+            InsnFound = TRUE;
+            break;
+        }
+
+        if (!InsnFound) continue;
+
+        KeSweepIcacheRange = (PVOID)FuncStart;
+        break;
+    }
+	
+	if (KeSweepIcacheRange == NULL) return FALSE;
+
+    FuncStart = KeFlushEntireTb;
+    FuncEnd = FindSymbolNextStart((ULONG)ImageBase, Exceptions, ExceptionDir->Size, FuncStart);
+    while (TRUE) {
+        // Get the next function
+        FuncStart = FuncEnd;
+        FuncEnd = FindSymbolNextStart((ULONG)ImageBase, Exceptions, ExceptionDir->Size, FuncStart);
+        if (FuncEnd == NULL) break;
+
+        BOOLEAN InsnFound = FALSE;
+        for (PPPC_INSTRUCTION Insn = (PPPC_INSTRUCTION)FuncStart; Insn < (PPPC_INSTRUCTION)FuncEnd; Insn++) {
+            PPC_INSTRUCTION Insn2;
+            Insn2.Long = Insn->Long;
+            // lwz ..., 0xD51C(x)
+            if (Insn2.Primary_Op != LWZ_OP) continue;
+            if ((Insn2.Long & 0xFFFF) != 0xD51C) continue;
+
+            InsnFound = TRUE;
+			KeSweepFirstInsn = Insn;
+            break;
+        }
+
+        if (!InsnFound) continue;
+
+        KeSweepFirst = (PVOID)FuncStart;
+        break;
+    }
+
+    if (KeSweepFirst == NULL) return FALSE;
+	
+	// Same for the other one
+	while (TRUE) {
+        // Get the next function
+        FuncStart = FuncEnd;
+        FuncEnd = FindSymbolNextStart((ULONG)ImageBase, Exceptions, ExceptionDir->Size, FuncStart);
+        if (FuncEnd == NULL) break;
+        if (FuncEnd >= KiSystemStartup) break;
+
+        BOOLEAN InsnFound = FALSE;
+        for (PPPC_INSTRUCTION Insn = (PPPC_INSTRUCTION)FuncStart; Insn < (PPPC_INSTRUCTION)FuncEnd; Insn++) {
+            PPC_INSTRUCTION Insn2;
+            Insn2.Long = Insn->Long;
+            // lwz ..., 0xD51C(x)
+            if (Insn2.Primary_Op != LWZ_OP) continue;
+            if ((Insn2.Long & 0xFFFF) != 0xD51C) continue;
+
+            InsnFound = TRUE;
+			KeSweepSecondInsn = Insn;
+            break;
+        }
+
+        if (!InsnFound) continue;
+
+        KeSweepSecond = (PVOID)FuncStart;
+        break;
+    }
+	
+	if (KeSweepSecond == NULL) return FALSE;
+	
+	// KeSweepIcacheRange is always after KeSweepIcache;
+	// if it's between the two, then lowest address is KeSweepIcache and other one is KeSweepDcache
+	// if it's after both, then the lowest address is KeSweepDcache and other one is KeSweepIcache
+	PPPC_INSTRUCTION KeSweepIcacheInsn = NULL;
+	if (KeSweepIcacheRange > KeSweepFirst && KeSweepIcacheRange > KeSweepSecond) {
+		fporig_KeSweepDcache.Function = (ULONG)KeSweepFirst;
+		fporig_KeSweepIcache.Function = (ULONG)KeSweepSecond;
+		KeSweepIcacheInsn = KeSweepSecondInsn;
+	} else if (KeSweepIcacheRange > KeSweepFirst && KeSweepIcacheRange < KeSweepSecond) {
+		fporig_KeSweepIcache.Function = (ULONG)KeSweepFirst;
+		fporig_KeSweepDcache.Function = (ULONG)KeSweepSecond;
+		KeSweepIcacheInsn = KeSweepFirstInsn;
+	} else {
+		// ??? what kernel is this???
+		return FALSE;
+	}
+	
+	fporig_KeSweepIcacheRange.Function = (ULONG)KeSweepIcacheRange;
+	FuncEnd = FindSymbolNextStart((ULONG)ImageBase, Exceptions, ExceptionDir->Size, (PVOID)fporig_KeSweepIcache.Function);
+	if (FuncEnd == NULL) return FALSE;
+	
+	// Go get KiIpiSendPacket and KiIpiSignalPacketDone and KiIpiStallOnPacketTargets
+	PVOID KiIpiSendPacket = NULL;
+	PVOID KiIpiSignalPacketDone = NULL;
+	PVOID KiIpiStallOnPacketTargets = NULL;
+	{
+		BOOLEAN InsnFound = FALSE;
+		PPPC_INSTRUCTION BlInsn = NULL;
+        for (PPPC_INSTRUCTION Insn = (PPPC_INSTRUCTION)KeSweepIcacheInsn; Insn < (PPPC_INSTRUCTION)FuncEnd; Insn++) {
+            PPC_INSTRUCTION Insn2;
+            Insn2.Long = Insn->Long;
+            // bl
+            if (Insn2.Primary_Op != B_OP) continue;
+            if (!Insn2.Bform_LK) continue;
+
+			LONG BranchOffset = HookSignExtBranch(Insn2.Iform_LI << 2);
+			KiIpiSendPacket = (PVOID)((ULONG)Insn + BranchOffset);
+			BlInsn = Insn;
+            InsnFound = TRUE;
+            break;
+        }
+		
+		if (!InsnFound) return FALSE;
+		
+		InsnFound = FALSE;
+		
+		for (PPPC_INSTRUCTION Insn = (PPPC_INSTRUCTION)(BlInsn + 1); Insn < (PPPC_INSTRUCTION)FuncEnd; Insn++) {
+            PPC_INSTRUCTION Insn2;
+            Insn2.Long = Insn->Long;
+            // bl
+            if (Insn2.Primary_Op != B_OP) continue;
+            if (!Insn2.Bform_LK) continue;
+
+			LONG BranchOffset = HookSignExtBranch(Insn2.Iform_LI << 2);
+			KiIpiStallOnPacketTargets = (PVOID)((ULONG)Insn + BranchOffset);
+            InsnFound = TRUE;
+            break;
+        }
+		
+		if (!InsnFound) return FALSE;
+		
+		InsnFound = FALSE;
+		PVOID KiSweepIcacheTarget = NULL;
+		
+		for (PPPC_INSTRUCTION Insn = BlInsn; Insn > (PPPC_INSTRUCTION)KeSweepIcacheInsn; Insn--) {
+			PPC_INSTRUCTION Insn2;
+            Insn2.Long = Insn->Long;
+            // lwz r4, x(r2)
+            if (Insn2.Primary_Op != LWZ_OP) continue;
+            if (Insn2.Dform_RT != 4) continue;
+            if (Insn2.Dform_RA != 2) continue;
+			PAIXCALL_FPTR pFptr = *(PAIXCALL_FPTR*)(KernelToc + Insn2.Dform_D);
+			KiSweepIcacheTarget = (PVOID)pFptr->Function;
+            InsnFound = TRUE;
+            break;
+		}
+		
+		if (!InsnFound) return FALSE;
+		
+		FuncEnd = FindSymbolNextStart((ULONG)ImageBase, Exceptions, ExceptionDir->Size, KiSweepIcacheTarget);
+		if (FuncEnd == NULL) return FALSE;
+		
+		InsnFound = FALSE;
+		
+		for (PPPC_INSTRUCTION Insn = (PPPC_INSTRUCTION)FuncEnd; Insn > (PPPC_INSTRUCTION)KiSweepIcacheTarget; Insn--) {
+            PPC_INSTRUCTION Insn2;
+            Insn2.Long = Insn->Long;
+            // bl
+            if (Insn2.Primary_Op != B_OP) continue;
+            if (!Insn2.Bform_LK) continue;
+
+			LONG BranchOffset = HookSignExtBranch(Insn2.Iform_LI << 2);
+			KiIpiSignalPacketDone = (PVOID)((ULONG)Insn + BranchOffset);
+            InsnFound = TRUE;
+            break;
+        }
+		
+		if (!InsnFound) return FALSE;
+	}
+	
+	fporig_KiIpiSendPacket.Function = KiIpiSendPacket;
+	fporig_KiIpiSendPacket.Toc = KernelToc;
+	fporig_KiIpiSignalPacketDone.Function = KiIpiSignalPacketDone;
+	fporig_KiIpiSignalPacketDone.Toc = KernelToc;
+	fporig_KiIpiStallOnPacketTargets.Function = KiIpiStallOnPacketTargets;
+	fporig_KiIpiStallOnPacketTargets.Toc = KernelToc;
+	
+	PPC_HOOK_DO((PVOID*)&orig_KeSweepIcache, hook_KeSweepIcache);
+	PPC_HOOK_DO((PVOID*)&orig_KeSweepDcache, hook_KeSweepDcache);
+	PPC_HOOK_DO((PVOID*)&orig_KeSweepIcacheRange, hook_KeSweepIcacheRange);
+	
+	// Patch single instruction in KeFlushIoBuffers;
+	// we want both caches to be flushed always to ensure consistency
+    FuncStart = PeGetProcAddress(ImageBase, Export, "KeFlushIoBuffers");
+	if (FuncStart == NULL) return FALSE;
+    FuncEnd = FindSymbolNextStart((ULONG)ImageBase, Exceptions, ExceptionDir->Size, FuncStart);
+	{
+		BOOLEAN InsnFound = FALSE;
+        for (PPPC_INSTRUCTION Insn = (PPPC_INSTRUCTION)FuncStart; Insn < (PPPC_INSTRUCTION)FuncEnd; Insn++) {
+            PPC_INSTRUCTION Insn2;
+            Insn2.Long = Insn->Long;
+            // ble ...
+            if (Insn2.Primary_Op != BC_OP) continue;
+            if ((Insn2.Bform_BO & ~1) != 4) continue; // branch if false
+			if ((Insn2.Bform_BI & 3) != 1) continue; // greater than - ie, branch if not greater than => branch if less than or equal
+
+			Insn->Long = 0x60000000; // nop
+            InsnFound = TRUE;
+            break;
+        }
+
+        if (!InsnFound) return FALSE;
+	}
 	
 	
 	// Dynamically import the needed functions, and hook those that need hooking.
@@ -2380,9 +2760,20 @@ BOOLEAN HalpHookKernelPeLoader(PVOID ImageBase) {
 	GET_PROC_ADDRESS_ORIG_AND_HOOK(MmMapViewInSystemSpace);
 	GET_PROC_ADDRESS_ORIG_AND_HOOK(IoPageRead);
 	GET_PROC_ADDRESS_ORIG_AND_HOOK(FsRtlGetFileSize);
+	GET_PROC_ADDRESS_ORIG_AND_HOOK(KeFlushIoBuffers);
 	//GET_PROC_ADDRESS_ORIG_AND_HOOK(IofCallDriver);
 	GET_PROC_ADDRESS_ORIG_AND_HOOK(MmPageEntireDriver);
-	GET_PROC_ADDRESS_ORIG_AND_HOOK(RtlVirtualUnwind);
+	//GET_PROC_ADDRESS_ORIG_AND_HOOK(RtlVirtualUnwind);
+	//GET_PROC_ADDRESS_ORIG_AND_HOOK(KeBugCheckEx);
+	//GET_PROC_ADDRESS_ORIG_AND_HOOK(IoCancelIrp);
+	
+	#if 0
+	{
+		fporig_MmMapViewInSystemSpace.Function = (ULONG)PeGetProcAddress(ImageBase, Export, "MmMapViewInSystemSpace");
+		if (fporig_MmMapViewInSystemSpace.Function == 0) return FALSE;
+		fporig_MmMapViewInSystemSpace.Toc = (ULONG)KernelToc;
+	}
+	#endif
 	
 #if 0
 	// for debug: set PAGE_FAULT_IN_NONPAGED_AREA arg2 to faulting address
@@ -2391,6 +2782,7 @@ BOOLEAN HalpHookKernelPeLoader(PVOID ImageBase) {
 	*(PULONG)(0x8069b4a8 - 0x80648000 + ImageBase) = insn;
 	*(PULONG)(0x8069b4d8 - 0x80648000 + ImageBase) = insn;
 	*(PULONG)(0x8069b5a4 - 0x80648000 + ImageBase) = insn;
+	*(PULONG)(0x8069b4e4 - 0x80648000 + ImageBase) = 0x38e00001; // li r7, 1
 #endif
 	
 	// Get RtlPcToFileHeader. This is the first bl instruction in RtlLookupFunctionEntry (exported)
