@@ -10,6 +10,7 @@ extern PEXI_REGISTERS HalpExiRegs;
 extern PPXI_REGISTERS HalpPxiRegisters;
 extern IDTUsage        HalpIDTUsage[MAXIMUM_IDTVECTOR];
 static ULONG s_LastProcessorStarted = 0;
+static BOOLEAN s_ForceUniprocessor = FALSE;
 
 
 static const USHORT s_HalName[] = {
@@ -36,6 +37,13 @@ BOOLEAN HalStartNextProcessor(IN PLOADER_PARAMETER_BLOCK LoaderBlock, IN PKPROCE
 	if (HalpSystemIsUniprocessor()) return FALSE;
 	if (s_LastProcessorStarted == 2) return FALSE;
 	BOOLEAN IsCafe = HalpSystemIsCafe();
+	// Flipper VI/GX driver inside textmode is broken in multiprocessor.
+	// If not cafe, and in textmode setup, don't bring up other cores.
+	if (!IsCafe && LoaderBlock->SetupLoaderBlock != NULL) {
+		s_ForceUniprocessor = TRUE;
+		return FALSE;
+	}
+	if (s_ForceUniprocessor) return FALSE;
 	
 	// Violate the license agreement. (NT Workstation only allows 2 CPUs)
 	// KeRegisteredProcessors located 4 bytes after exported KeNumberProcessors, this is true in all of PPC NT
@@ -191,6 +199,7 @@ BOOLEAN HalStartNextProcessor(IN PLOADER_PARAMETER_BLOCK LoaderBlock, IN PKPROCE
 // Determine if all processors are started.
 BOOLEAN HalAllProcessorsStarted(void) {
 	if (HalpSystemIsUniprocessor()) return TRUE;
+	if (s_ForceUniprocessor) return TRUE;
 	return (s_LastProcessorStarted == 2); // core2 is last.
 }
 
