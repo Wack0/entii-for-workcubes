@@ -823,6 +823,21 @@ static void video_encoder_init_vga(void) {
 #define mfpvr() ({u32 _rval; \
 		__asm__ __volatile__ ("mfpvr %0" : "=r"(_rval)); _rval;})
 
+#define __stringify(rn)	#rn
+#define mfspr(_rn) \
+({	u32 _rval = 0; \
+	__asm__ __volatile__ ("mfspr %0," __stringify(_rn) \
+	: "=r" (_rval));\
+	_rval; \
+})
+
+#define mtspr(_rn, _val) __asm__ __volatile__ ("mtspr " __stringify(_rn) ",%0" : : "r" (_val))
+#define mfhid0()		mfspr(HID0)
+#define mthid0(_val)	mtspr(HID0,_val)
+#define HID0		1008
+#define HID0_ABE (1 << 3)
+#define HID0_IFEM (1 << 8)
+
 // Pwn IOS:
 // - Enforce PPC access to all hardware.
 // - On vWii, reboot PPC and race its bootrom to gain access to the other 2 cores.
@@ -835,7 +850,12 @@ static void EnchantIOP(void) {
 		// If this isn't vWii, no need to do anything.
 		if ((read32(0xCD8005A0) >> 16) != 0xCAFE) return;
 		// If not in broadway compat mode, do nothing.
-		if ((mfpvr() >> 16) != 8) return;
+		if ((mfpvr() >> 16) != 8) {
+			// Set HID0_ABE and HID0_IFEM
+			mthid0(mfhid0() | HID0_ABE | HID0_IFEM);
+			asm volatile("sync");
+			return;
+		}
 		//printf("Gaining root...\n");
 	} //else printf("Gaining AHBPROT and IOS root...\n");
 	
