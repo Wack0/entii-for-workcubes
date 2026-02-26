@@ -41,3 +41,16 @@ void HalFlushIoBuffers(PMDL Mdl, BOOLEAN ReadOperation, BOOLEAN DmaOperation) {
 		Length -= PartialLength;
 	} while (Length != 0);
 }
+
+// https://github.com/fail0verflow/hbc/blob/a8e5f6c0f7e484c7f7112967eee6eee47b27d9ac/wiipax/stub/sync.c#L29
+void HalSyncBeforeExecution(PVOID BaseAddress, ULONG Length) {
+	ULONG a, b;
+
+	a = (ULONG)p & ~0x1f;
+	b = ((ULONG)p + len + 0x1f) & ~0x1f;
+
+	for (; a < b; a += 32)
+		asm("dcbst 0,%0 ; sync ; icbi 0,%0" : : "b"(a));
+
+	asm("sync ; isync");
+}

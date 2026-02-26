@@ -125,3 +125,5 @@ EXPORTS
     HalExiTransferDmaAsync
     HalExiGetDeviceIdentifier
     HalExiToggleInterrupt
+
+    HalSyncBeforeExecution
