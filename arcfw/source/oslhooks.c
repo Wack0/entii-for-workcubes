@@ -16,6 +16,8 @@
 #include "pxi.h"
 #include "runtime.h"
 
+//#define DEBUG_ON_LEGACY_SYSTEM 1
+
 static PVOID ScratchAddress = NULL;
 
 static inline ARC_FORCEINLINE ULONG ScratchEnd() {
@@ -61,7 +63,8 @@ typedef enum {
 
 typedef enum {
     AOT_NONE,
-    AOT_STWCX
+    AOT_STWCX,
+	AOT_TLBSYNC
 } INSTRUCTION_AOT_TYPE;
 
 // Define ARC boot library structures used here.
@@ -508,6 +511,15 @@ static ULONG InstructionNeedsAot(ULONG i, INSTRUCTION_AOT_TYPE* AotType) {
         *AotType = AOT_STWCX;
         return 3 * sizeof(ULONG);
     }
+	
+	// tlbsync patch:
+	// isync
+	// tlbsync
+	// b next_insn
+	if (Insn.Xform_XO == TLBSYNC_OP) {
+		*AotType = AOT_TLBSYNC;
+		return 3 * sizeof(ULONG);
+	}
 
     return 0;
 }
@@ -615,6 +627,31 @@ static ARC_STATUS InstructionPatchAot(
         (*TablePointer)[0] = AotInsn.Long;
         (*TablePointer)++;
         // b next_insn
+        AotInsn.Long = 0;
+        AotInsn.Primary_Op = B_OP;
+        AotInsn.Iform_LK = 0;
+        AotInsn.Iform_AA = 0;
+        JumpOffset = ((ULONG)&SectionBase[Offset + 1] - ((ULONG)TablePointer[1] + ((ULONG)*TablePointer - TablePointerStart)));
+        if (!is_offset_in_branch_range(JumpOffset)) {
+            //DEBUG_PANIC("branch out of range 3\n");
+            return 10204;
+        }
+        AotInsn.Iform_LI = JumpOffset >> 2;
+        (*TablePointer)[0] = AotInsn.Long;
+        (*TablePointer)++;
+        break;
+	case AOT_TLBSYNC:
+		// isync
+		AotInsn.Long = 0;
+		AotInsn.Primary_Op = X19_OP;
+		AotInsn.Xform_XO = ISYNC_OP;
+        (*TablePointer)[0] = AotInsn.Long;
+        (*TablePointer)++;
+		// tlbsync
+        AotInsn.Long = OriginalInsn.Long;
+        (*TablePointer)[0] = AotInsn.Long;
+        (*TablePointer)++;
+		// b next_insn
         AotInsn.Long = 0;
         AotInsn.Primary_Op = B_OP;
         AotInsn.Iform_LK = 0;
@@ -851,6 +888,55 @@ static ARC_STATUS PePatch_Relocate(PPE_PATCH_ENTRY Patch) {
                 insn->Long = AotInsn.Long;
             }
 
+            // Patch page fault handler, to ensure PCR/PCR2 pages are mapped as coherent + guarded (same as when MSR_DR disabled)
+            for (ULONG addr = (ULONG)s_NtKernelReal0; addr < (ULONG)s_NtKernelReal0End; addr += 4) {
+                PPPC_INSTRUCTION insn = (PPPC_INSTRUCTION)addr;
+                // cmpwi r3, x ; ori r2, r2, 1
+                if (((insn->Long & 0xFFFF0000) == 0x2C030000) && (insn[1].Long == 0x60420001)) {
+                    insn[1].Long |= 0x18; // set coherent + guarded
+                    if (insn[3].Long == 0x5442003C) { // clrrrwi r2, r2, 1
+                        insn[3].Long = 0x7C5042A6; // mfsprg0 r2
+                    }
+                }
+            }
+
+            // Ensure all pagetables are mapped coherent.
+            // xnu does this (always sets M flag in WIMG when mapping memory), how did NT ever work on multiprocessor powerpc systems???
+            {
+                // Find .data section.
+                ULONG rvaData = 0;
+                ULONG lenData = 0;
+                for (USHORT i = 0; i < NumberOfSections; i++) {
+                    // 807 has IMAGE_SCN_MEM_NOT_PAGED flag not set, so just in case someone ever patches it up to run on something not a 601...
+                    if ((Sections[i].Characteristics & ~IMAGE_SCN_MEM_NOT_PAGED) != (IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE | IMAGE_SCN_CNT_INITIALIZED_DATA))
+                        continue;
+
+                    // 807 has .bss before .data
+                    if (Sections[i].SizeOfRawData == 0) continue;
+
+                    rvaData = Sections[i].VirtualAddress;
+                    lenData = Sections[i].SizeOfRawData;
+                    break;
+                }
+
+                if (rvaData == 0) return 11100;
+
+                PVOID pData = (PVOID)(ImageBase + rvaData);
+
+                // ValidKernelPte, ValidUserPte, ...
+                static ULONG s_ValidPtes[] = { 0x204, 0x204 };
+                PULONG pValidPtes = (PULONG)mem_mem(pData, s_ValidPtes, lenData, sizeof(s_ValidPtes));
+                if (pValidPtes == NULL) return 11101;
+
+                for (; *pValidPtes == 0x204; pValidPtes++) *pValidPtes |= 0x10; // set M bit
+
+                // Find MmProtectToPteMask
+                static ULONG s_ProtectToPteMask[] = { 0, 3, 3, 3 };
+                PULONG MmProtectToPteMask = (PULONG)mem_mem(pData, s_ProtectToPteMask, lenData, sizeof(s_ProtectToPteMask));
+                if (MmProtectToPteMask == NULL) return 11102;
+                for (ULONG i = 0; i < 32; i++) MmProtectToPteMask[i] |= 0x10; // set M bit
+            }
+
             // Deal with stwcx instructions in PTE functions
             for (ULONG addr = (ULONG)s_NtKernelPteStart; addr < (ULONG)s_NtKernelPteEnd; addr += 4) {
                 PPPC_INSTRUCTION insn = (PPPC_INSTRUCTION)addr;
@@ -873,6 +959,51 @@ static ARC_STATUS PePatch_Relocate(PPE_PATCH_ENTRY Patch) {
                 AotInsn.Xform_RB = insn->Xform_RB;
                 insn_cave[0].Long = AotInsn.Long;
                 // stwcx rt,ra,rb
+                insn_cave[1].Long = insn->Long;
+                // b next_insn
+                AotInsn.Long = 0;
+                AotInsn.Primary_Op = B_OP;
+                AotInsn.Iform_LK = 0;
+                AotInsn.Iform_AA = 0;
+                LONG JumpOffset = (ULONG)&insn[1] - (ULONG)&insn_cave[2];
+                if (!is_offset_in_branch_range(JumpOffset)) {
+                    return _E2BIG;
+                }
+                AotInsn.Iform_LI = JumpOffset >> 2;
+                insn_cave[2].Long = AotInsn.Long;
+
+                AotInsn.Long = 0;
+                AotInsn.Primary_Op = B_OP;
+                AotInsn.Iform_LK = 0;
+                AotInsn.Iform_AA = 0;
+                JumpOffset = (ULONG)&insn_cave[0] - (ULONG)&insn[0];
+                if (!is_offset_in_branch_range(JumpOffset)) {
+                    return _E2BIG;
+                }
+                AotInsn.Iform_LI = JumpOffset >> 2;
+                insn->Long = AotInsn.Long;
+            }
+			
+			// Deal with tlbsync instructions in PTE functions
+            for (ULONG addr = (ULONG)s_NtKernelPteStart; addr < (ULONG)s_NtKernelPteEnd; addr += 4) {
+                PPPC_INSTRUCTION insn = (PPPC_INSTRUCTION)addr;
+                if (insn->Primary_Op != X31_OP || insn->Xform_XO != TLBSYNC_OP) continue;
+                // start from the start of pte start, to ensure space can be found.
+                PULONG cave = (PULONG)s_NtKernelPteStart;
+                for (; cave < (PULONG)s_NtKernelPteEnd; cave++) {
+                    // we need three zeroed out entries in this cave in a row.
+                    if (cave[0] == 0 && cave[1] == 0 && cave[2] == 0) break;
+                }
+                if (cave >= (PULONG)s_NtKernelPteEnd) return 11100; // can't find a cave
+
+                PPPC_INSTRUCTION insn_cave = (PPPC_INSTRUCTION)cave;
+                // isync
+                PPC_INSTRUCTION AotInsn;
+				AotInsn.Long = 0;
+				AotInsn.Primary_Op = X19_OP;
+				AotInsn.Xform_XO = ISYNC_OP;
+                insn_cave[0].Long = AotInsn.Long;
+                // tlbsync
                 insn_cave[1].Long = insn->Long;
                 // b next_insn
                 AotInsn.Long = 0;
@@ -1089,7 +1220,7 @@ static ARC_STATUS fhook_BlSeek(ULONG FileId, PLARGE_INTEGER Offset, SEEK_MODE Se
 static ARC_STATUS fhook_BlRead(ULONG FileId, PVOID Buffer, ULONG Length, PU32LE Count) {
     // Get the patch entry
     PPE_PATCH_ENTRY Patch = &s_PatchTable[FileId];
-#if 0 // debugging on non-espresso
+#if DEBUG_ON_LEGACY_SYSTEM // debugging on non-espresso
     ULONG Pvr;
     __asm__ __volatile__("mfpvr %0" : "=r"(Pvr));
     Pvr >>= 16;
@@ -1102,7 +1233,7 @@ static ARC_STATUS fhook_BlRead(ULONG FileId, PVOID Buffer, ULONG Length, PU32LE 
         if (Patch->InjectedSectionIsFinal) {
             // this was the last section to load, so perform relocation now!
             Patch->State = STATE_NOP;
-#if 0 // debugging on non-espresso
+#if DEBUG_ON_LEGACY_SYSTEM // debugging on non-espresso
             if (Pvr != 0x7001) return _ESUCCESS; // do not actually inject anything fortesting
 #endif
             return PePatch_Relocate(Patch);
@@ -1155,7 +1286,7 @@ static ARC_STATUS fhook_BlRead(ULONG FileId, PVOID Buffer, ULONG Length, PU32LE 
         // Which means there's no need for any length check here, if we got here we're reading the last section.
         // Loaded the final section, perform relocation.
         Patch->State = STATE_NOP;
-#if 0 // debugging on non-espresso
+#if DEBUG_ON_LEGACY_SYSTEM // debugging on non-espresso
         if (Pvr != 0x7001) {
             return _ESUCCESS; // do not actually inject anything
         }
@@ -1292,7 +1423,9 @@ static ARC_STATUS hook_BlOpen(ULONG DeviceId, PCHAR OpenPath, OPEN_MODE OpenMode
     if (ARC_FAIL(Status)) return Status;
 
     // If the uniprocessor kernel was loaded, do nothing.
+#if !DEBUG_ON_LEGACY_SYSTEM
     if (s_KernelIsUniProcessor) return Status;
+#endif
 
     // File has been opened.
     ULONG Id = FileId->v;
@@ -1309,7 +1442,9 @@ static ARC_STATUS hook_BlOpen(ULONG DeviceId, PCHAR OpenPath, OPEN_MODE OpenMode
 
         if (KernelType == FILE_KERNEL_UNIPROCESSOR) {
             s_KernelIsUniProcessor = true;
+#if !DEBUG_ON_LEGACY_SYSTEM
             return Status;
+#endif
         }
         else if (KernelType == FILE_KERNEL_MULTIPROCESSOR) {
             s_KernelIsNotUniProcessor = true;
@@ -1470,10 +1605,12 @@ void OslHookInit(PVOID BlOpen, PVOID BlFileTable, PVOID BlSetupForNt, PVOID BlRe
     ULONG Pvr;
     __asm__ __volatile__("mfpvr %0" : "=r"(Pvr));
     Pvr >>= 16;
-#if 0 // debugging on non-espresso
+#if DEBUG_ON_LEGACY_SYSTEM // debugging on non-espresso
     Pvr = 0x7001;
-#endif
+    if (true) {
+#else
     if (Pvr == 0x7001 && s_RuntimePointers[RUNTIME_SYSTEM_TYPE].v == ARTX_SYSTEM_LATTE) {
+#endif
         orig_BlOpen = (PBL_OPEN_ROUTINE)BlOpen;
         s_BlFileTable = (PBL_FILE_TABLE)BlFileTable;
         if (ScratchAddress == NULL) ScratchAddress = ArcLoadGetScratchAddress();
