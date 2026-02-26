@@ -6,6 +6,7 @@
 #include "sdmc.h"
 #include "iosapi.h"
 #include "sdmcraw.h"
+#include "sdmclow.h"
 
 #include <stdio.h>
 
@@ -25,8 +26,19 @@ static KTIMER s_SdmcTimer;
 static KDPC s_SdmcDpc;
 
 enum {
-	COUNT_EMERGENCY_BLOCKS = 32
+	COUNT_EMERGENCY_BLOCKS = 32,
+	COUNT_COPY_DPC = 16,
 };
+
+typedef struct _SDMC_DPC_CONTEXT {
+	NTSTATUS Status;
+	KEVENT Event;
+	PVOID Dest;
+	PVOID Source;
+	ULONG Length;
+	ULONG ToMdl;
+	BOOLEAN InUse;
+} SDMC_DPC_CONTEXT, *PSDMC_DPC_CONTEXT;
 
 typedef struct _SDMC_LOCK_CONTEXT {
 	NTSTATUS Status;
@@ -34,8 +46,15 @@ typedef struct _SDMC_LOCK_CONTEXT {
 	ULONG Sector;
 	ULONG Count;
 	PVOID Buffer;
+	PMDL Mdl;
+	SDMC_LOCK_STATE State;
+	ULONG IoCount;
+	ULONG BufferPage;
+	PVOID DmaBuffer;
 	BOOLEAN InUse;
 } SDMC_LOCK_CONTEXT, *PSDMC_LOCK_CONTEXT;
+
+static KDPC s_DpcCopy[COUNT_COPY_DPC];
 
 typedef void (*SDMC_LOCK_CALLBACK)(PSDMC_LOCK_CONTEXT Context);
 
@@ -45,9 +64,11 @@ typedef struct _SDMC_WAIT_CONTROL_BLOCK {
 	PSDMC_LOCK_CONTEXT Context;
 } SDMC_WAIT_CONTROL_BLOCK, *PSDMC_WAIT_CONTROL_BLOCK;
 
+static KEVENT s_SdmcReadyEvent;
 static KDEVICE_QUEUE s_SdmcLockQueue = {0};
 static SDMC_WAIT_CONTROL_BLOCK s_EmergencyBlocks[COUNT_EMERGENCY_BLOCKS] = {0};
 static SDMC_LOCK_CONTEXT s_StateContext[COUNT_EMERGENCY_BLOCKS];
+static SDMC_DPC_CONTEXT s_DpcContext[COUNT_COPY_DPC];
 
 static BOOLEAN s_SdmcIsHighCapacity = FALSE;
 static BOOLEAN s_SdmcIsInitialised = FALSE;
@@ -57,12 +78,93 @@ static USHORT s_SdmcRca = 0;
 static UCHAR s_SdmcCid[16];
 static UCHAR s_SdmcCsd[16];
 
+static PDEVICE_OBJECT s_SdmcLowDevice = NULL;
+
+// https://github.com/fail0verflow/hbc/blob/a8e5f6c0f7e484c7f7112967eee6eee47b27d9ac/wiipax/stub/sync.c#L29
+static void sync_before_exec_this_cpu(const void* p, ULONG len)
+{
+
+	ULONG a, b;
+
+	a = (ULONG)p & ~0x1f;
+	b = ((ULONG)p + len + 0x1f) & ~0x1f;
+
+	for (; a < b; a += 32)
+		asm("dcbst 0,%0 ; sync ; icbi 0,%0" : : "b"(a));
+
+	asm("sync ; isync");
+}
+
+static void endian_swap64(void* dest, const void* src, ULONG len);
+NTHALAPI void HalSyncBeforeExecution(const void* BaseAddress, ULONG Length);
+
+#define sync_before_exec(a,b) HalSyncBeforeExecution(a,b)
+
+static void SdmcpCopyDpc(PKDPC Dpc, PVOID Unused, PVOID ContextVoid, PVOID Unused2) {
+	PSDMC_DPC_CONTEXT Context = (PSDMC_DPC_CONTEXT)ContextVoid;
+	
+	// Map the DPC.
+	PVOID Dest = Context->Dest;
+	PVOID Source = Context->Source;
+	ULONG Length = Context->Length;
+	NTSTATUS Status = STATUS_SUCCESS;
+	if (Context->ToMdl) {
+		// Destination is really MDL:
+		PMDL Mdl = (PMDL)Dest;
+		Dest = MmGetSystemAddressForMdl(Mdl);
+		if (Dest == NULL) Status = STATUS_UNSUCCESSFUL;
+	} else {
+		// Source is really MDL
+		PMDL Mdl = (PMDL)Source;
+		Source = MmGetSystemAddressForMdl(Mdl);
+		if (Source == NULL) Status = STATUS_UNSUCCESSFUL;
+	}
+	
+	if (NT_SUCCESS(Status)) {
+		memcpy(Dest, Source, Length);
+		if (Context->ToMdl) sync_before_exec(Dest, Length);
+	}
+	
+	Context->Status = Status;
+	
+	KeSetEvent(&Context->Event, (KPRIORITY) 0, FALSE);
+}
+
+static BOOLEAN SdmcpQueueDpc(PSDMC_DPC_CONTEXT Context) {
+	BOOLEAN AlreadyQueued = FALSE;
+	for (ULONG i = 0; i < COUNT_COPY_DPC; i++) {
+		AlreadyQueued = KeInsertQueueDpc(&s_DpcCopy[i], Context, NULL);
+		if (AlreadyQueued) break;
+	}
+	return !AlreadyQueued;
+}
+
+static PSDMC_DPC_CONTEXT SdmcpGetDpcContext(void) {
+	for (ULONG i = 0; i < COUNT_COPY_DPC; i++) {
+		PSDMC_DPC_CONTEXT ctx = &s_DpcContext[i];
+		if (!ctx->InUse) {
+			KeInitializeEvent(&ctx->Event, NotificationEvent, FALSE);
+			ctx->Status = STATUS_SUCCESS;
+			ctx->InUse = 1;
+			return ctx;
+		}
+	}
+	return NULL;
+}
+
+static void SdmcpReleaseDpcContext(PSDMC_DPC_CONTEXT ctx) {
+	ctx->InUse = 0;
+}
+
 static PSDMC_LOCK_CONTEXT SdmcpGetStateContext(void) {
 	for (ULONG i = 0; i < COUNT_EMERGENCY_BLOCKS; i++) {
 		PSDMC_LOCK_CONTEXT ctx = &s_StateContext[i];
 		if (!ctx->InUse) {
-			KeInitializeEvent(&ctx->Event, SynchronizationEvent, FALSE);
+			KeInitializeEvent(&ctx->Event, NotificationEvent, FALSE);
 			ctx->Status = STATUS_SUCCESS;
+			ctx->State = LOCK_STATE_SELECT;
+			ctx->BufferPage = 0xFFFFFFFF;
+			ctx->DmaBuffer = NULL;
 			ctx->InUse = 1;
 			return ctx;
 		}
@@ -75,6 +177,17 @@ static void SdmcpReleaseStateContext(PSDMC_LOCK_CONTEXT ctx) {
 }
 
 static NTSTATUS SdmcpLockController(SDMC_LOCK_CALLBACK callback, PSDMC_LOCK_CONTEXT context) {
+#if 0
+	if (*KeNumberProcessors > 1) {
+		// Wait on the sdmc ready event.
+		KeWaitForSingleObject( &s_SdmcReadyEvent, Executive, KernelMode, FALSE, NULL);
+		// Call the callback, which should be synchronous.
+		callback(context);
+		// Raise the ready event to allow some other thread to call the callback.
+		KeSetEvent(&s_SdmcReadyEvent, (KPRIORITY)0, FALSE);
+		return STATUS_SUCCESS;
+	}
+#endif
 	// Allocate a control block to store the callback.
 	PSDMC_WAIT_CONTROL_BLOCK Block = (PSDMC_WAIT_CONTROL_BLOCK) ExAllocatePool(NonPagedPool, sizeof(SDMC_WAIT_CONTROL_BLOCK));
 	if (Block == NULL) {
@@ -207,6 +320,8 @@ typedef struct _IOS_SDMC_SEND_COMMAND_BUFFER {
 #if 0
 	PIOS_ASYNC_CONTEXT Async;
 #endif
+	IOP_CALLBACK Callback;
+	PVOID Context;
 } IOS_SDMC_SEND_COMMAND_BUFFER, *PIOS_SDMC_SEND_COMMAND_BUFFER;
 
 #if 0
@@ -370,6 +485,46 @@ static NTSTATUS SdmcpSendCommandImpl(
 }
 #endif
 
+static void SdmcpCommandAsyncFinish(NTSTATUS Status, ULONG Result, PVOID Context) {
+	PIOS_SDMC_SEND_COMMAND_BUFFER CmdBuf = (PIOS_SDMC_SEND_COMMAND_BUFFER)Context;
+	
+	if (!NT_SUCCESS(Status) && CmdBuf->Vectors[0].Pointer != NULL) {
+		// fall back to ioctl
+		CmdBuf->Vectors[0].Pointer = NULL;
+		Status = HalIopIoctlAsyncDpc(
+			s_hIosSdmc,
+			IOCTL_SDIO_SENDCMD,
+			&CmdBuf->Command,
+			sizeof(IOS_SDMC_COMMAND),
+			&CmdBuf->Response,
+			sizeof(IOS_SDMC_RESPONSE),
+			IOCTL_SWAP_NONE, IOCTL_SWAP_NONE,
+			SdmcpCommandAsyncFinish, CmdBuf
+		);
+		if (NT_SUCCESS(Status)) return;
+	}
+	
+	IOP_CALLBACK Callback = CmdBuf->Callback;
+	Context = CmdBuf->Context;
+	ULONG Command = CmdBuf->Command.Command;
+	BOOLEAN CanTimeoutOnIosSide = TRUE;
+	if (
+		Command == SDIO_CMD_READBLOCK ||
+		Command == SDIO_CMD_READMULTIBLOCK ||
+		Command == SDIO_CMD_WRITEBLOCK ||
+		Command == SDIO_CMD_WRITEMULTIBLOCK
+	) {
+		CanTimeoutOnIosSide = FALSE;
+	}
+	
+	HalIopFree(CmdBuf);
+	// Toggle the disc LED gpio.
+	if (!CanTimeoutOnIosSide)
+		MmioWrite32((PVOID)0x8d8000c0, MmioRead32((PVOID)0x8d8000c0) ^ 0x20);
+	
+	Callback(Status, Result, Context);
+}
+
 static NTSTATUS SdmcpSendCommandImpl(
 	PIOS_SDMC_SEND_COMMAND_BUFFER CmdBuf,
 	BOOLEAN CanTimeoutOnIosSide
@@ -398,6 +553,37 @@ static NTSTATUS SdmcpSendCommandImpl(
 		&CmdBuf->Response,
 		sizeof(IOS_SDMC_RESPONSE),
 		IOCTL_SWAP_NONE, IOCTL_SWAP_NONE
+	);
+}
+
+static NTSTATUS SdmcpSendCommandAsyncImpl(
+	PIOS_SDMC_SEND_COMMAND_BUFFER CmdBuf,
+	BOOLEAN CanTimeoutOnIosSide
+) {
+	(void)CanTimeoutOnIosSide;
+
+	// Assumption: don't need to deal with endianness swap here, it will be dealt with further up the call stack for reads/writes.
+	
+	if (CmdBuf->Vectors[0].Pointer != NULL) {
+		return HalIopIoctlvAsyncDpc(
+			s_hIosSdmc,
+			IOCTL_SDIO_SENDCMD,
+			2,
+			1,
+			CmdBuf->Vectors,
+			0, 0,
+			SdmcpCommandAsyncFinish, CmdBuf
+		);
+	}
+	return HalIopIoctlAsyncDpc(
+		s_hIosSdmc,
+		IOCTL_SDIO_SENDCMD,
+		&CmdBuf->Command,
+		sizeof(IOS_SDMC_COMMAND),
+		&CmdBuf->Response,
+		sizeof(IOS_SDMC_RESPONSE),
+		IOCTL_SWAP_NONE, IOCTL_SWAP_NONE,
+		SdmcpCommandAsyncFinish, CmdBuf
 	);
 }
 
@@ -471,6 +657,73 @@ static NTSTATUS SdmcpSendCommand(
 	// Toggle the disc LED gpio.
 	if (!CanTimeoutOnIosSide)
 		MmioWrite32((PVOID)0x8d8000c0, MmioRead32((PVOID)0x8d8000c0) ^ 0x20);
+	return Status;
+}
+
+static NTSTATUS SdmcpSendCommandAsync(
+	SDIO_COMMAND Command,
+	SDIO_COMMAND_TYPE Type,
+	SDIO_RESPONSE ResponseType,
+	ULONG Argument,
+	ULONG BlockCount,
+	ULONG BlockSize,
+	PVOID Buffer,
+	IOP_CALLBACK Callback,
+	PVOID Context
+) {
+	// Get the physical address for the DMA.
+	PHYSICAL_ADDRESS BufferPhys = {.QuadPart = 0};
+	BOOLEAN IsDma = (Buffer != NULL);
+	if (Buffer != NULL) {
+		BufferPhys = MmGetPhysicalAddress(Buffer);
+		if (BufferPhys.LowPart == 0) return STATUS_INVALID_PARAMETER;
+	}
+	
+	// Allocate command buffer in IPC RAM.
+	PIOS_SDMC_SEND_COMMAND_BUFFER CmdBuf = (PIOS_SDMC_SEND_COMMAND_BUFFER)
+		HalIopAlloc(sizeof(IOS_SDMC_SEND_COMMAND_BUFFER));
+	if (CmdBuf == NULL) return STATUS_INSUFFICIENT_RESOURCES;
+	
+	BOOLEAN CanTimeoutOnIosSide = TRUE;
+	if (
+		Command == SDIO_CMD_READBLOCK ||
+		Command == SDIO_CMD_READMULTIBLOCK ||
+		Command == SDIO_CMD_WRITEBLOCK ||
+		Command == SDIO_CMD_WRITEMULTIBLOCK
+	) {
+		CanTimeoutOnIosSide = FALSE;
+	}
+	
+	// Toggle the disc LED gpio.
+	if (!CanTimeoutOnIosSide)
+		MmioWrite32((PVOID)0x8d8000c0, MmioRead32((PVOID)0x8d8000c0) ^ 0x20);
+	
+	NTSTATUS Status = STATUS_UNSUCCESSFUL;
+	do {
+		CmdBuf->Callback = Callback;
+		CmdBuf->Context = Context;
+		CmdBuf->Command.Command = Command;
+		CmdBuf->Command.CommandType = Type;
+		CmdBuf->Command.ResponseType = ResponseType;
+		CmdBuf->Command.Argument = Argument;
+		CmdBuf->Command.BlockCount = BlockCount;
+		CmdBuf->Command.BlockSize = BlockSize;
+		CmdBuf->Command.Padding0 = CmdBuf->Command.Padding1 = 0;
+		CmdBuf->Command.IsDma = IsDma;
+		CmdBuf->Command.UserBuffer = BufferPhys.LowPart;
+		
+		if (s_SdmcIsHighCapacity || IsDma) {
+			CmdBuf->Vectors[0].Pointer = &CmdBuf->Command;
+			CmdBuf->Vectors[0].Length = sizeof(IOS_SDMC_COMMAND);
+			CmdBuf->Vectors[1].Pointer = Buffer;
+			CmdBuf->Vectors[1].Length = (BlockCount * BlockSize);
+			CmdBuf->Vectors[2].Pointer = &CmdBuf->Response;
+			CmdBuf->Vectors[2].Length = sizeof(IOS_SDMC_RESPONSE);
+		} else {
+			CmdBuf->Vectors[0].Pointer = NULL;
+		}
+		Status = SdmcpSendCommandAsyncImpl(CmdBuf, CanTimeoutOnIosSide);
+	} while (FALSE);
 	return Status;
 }
 
@@ -607,6 +860,14 @@ static NTSTATUS SdmcpSelect(void) {
 
 static NTSTATUS SdmcpDeSelect(void) {
 	return SdmcpSendCommand(SDIO_CMD_DESELECT, SDIO_TYPE_CMD, SDIO_RESPONSE_R1B, 0, 0, 0, NULL, NULL);
+}
+
+static NTSTATUS SdmcpSelectAsync(IOP_CALLBACK Callback, PVOID Context) {
+	return SdmcpSendCommandAsync(SDIO_CMD_SELECT, SDIO_TYPE_CMD, SDIO_RESPONSE_R1B, s_SdmcRca << 16, 0, 0, NULL, Callback, Context);
+}
+
+static NTSTATUS SdmcpDeSelectAsync(IOP_CALLBACK Callback, PVOID Context) {
+	return SdmcpSendCommandAsync(SDIO_CMD_DESELECT, SDIO_TYPE_CMD, SDIO_RESPONSE_R1B, 0, 0, 0, NULL, Callback, Context);
 }
 
 static NTSTATUS SdmcpSetBlockLength(ULONG BlockLen) {
@@ -829,11 +1090,18 @@ NTSTATUS SdmcStartup(void) {
 		KeInitializeSpinLock(&s_SdmcDmaMapLock);
 		
 		KeInitializeDeviceQueue(&s_SdmcLockQueue);
+		KeInitializeEvent(&s_SdmcReadyEvent, SynchronizationEvent, TRUE);
 #if 0
 		// Initialise the timer and DPC.
 		KeInitializeDpc(&s_SdmcDpc, SdmcpTimerCallback, NULL);
 		KeInitializeTimer(&s_SdmcTimer);
 #endif
+
+		// Initialise the byteswap DPCs.
+		for (ULONG i = 0; i < COUNT_COPY_DPC; i++) {
+			KeInitializeDpc(&s_DpcCopy[i], SdmcpCopyDpc, NULL);
+			KeSetTargetProcessorDpc(&s_DpcCopy[i], 0);
+		}
 	}
 #if 0
 	if (s_AsyncContext == NULL) {
@@ -864,7 +1132,172 @@ NTSTATUS SdmcStartup(void) {
 	return STATUS_SUCCESS;
 }
 
-static NTSTATUS SdmcpReadSectorsLockedImpl(ULONG Sector, ULONG NumSector, PVOID Buffer) {
+static void SdmcpSectorIoFreeMapBuffer(PSDMC_LOCK_CONTEXT Context) {
+	if (Context->DmaBuffer == NULL) return;
+	KeAcquireSpinLockAtDpcLevel(&s_SdmcDmaMapLock);
+	RtlClearBits(&s_SdmcDmaMap, Context->BufferPage, 1);
+	Context->DmaBuffer = NULL;
+	KeReleaseSpinLockFromDpcLevel(&s_SdmcDmaMapLock);
+}
+
+static void SdmcpReadSectorsLockedAsync(NTSTATUS Status, ULONG Result, PSDMC_LOCK_CONTEXT Context);
+
+static void SdmcpSectorIoAsyncDeSelect(NTSTATUS Status, PSDMC_LOCK_CONTEXT Context) {
+	// Set the returning status.
+	Context->Status = Status;
+		
+	// Deselect the SD card.
+	Context->State = LOCK_STATE_FINISHED;
+	Status = SdmcpDeSelectAsync((IOP_CALLBACK)SdmcpReadSectorsLockedAsync, Context);
+	if (!NT_SUCCESS(Status)) {
+		KeSetEvent(&Context->Event, (KPRIORITY)0, FALSE);
+	}
+}
+
+static void SdmcpReadSectorsLockedAsync(NTSTATUS Status, ULONG Result, PSDMC_LOCK_CONTEXT Context) {
+	// Async is used on a multiprocessor system, reading into MDL.
+	// This ensures all accesses through an MDL do use CPU 0 exclusively, which is where all IOP requests end up.
+	if (Context->State == LOCK_STATE_SELECT) {
+		// First SdmcpSelect async. On success, the callback will execute on CPU 0 in DPC context.
+		Context->State = LOCK_STATE_FIRST_PAGE;
+		Status = SdmcpSelectAsync((IOP_CALLBACK)SdmcpReadSectorsLockedAsync, Context);
+		if (!NT_SUCCESS(Status)) {
+			Context->Status = Status;
+			KeSetEvent(&Context->Event, (KPRIORITY)0, FALSE);
+		}
+		return;
+	}
+	
+	if (Context->State == LOCK_STATE_FINISHED) {
+		// Callback from final SdmcpDeSelectAsync.
+		// Assume Context->Status was already set in a previous callback.
+		// Set the finalise event and return.
+		KeSetEvent(&Context->Event, (KPRIORITY)0, FALSE);
+		return;
+	}
+	
+	if (!NT_SUCCESS(Status)) {
+		// Previous call did not succeed.
+#if 0
+		char Buffer[1024];
+		_snprintf(Buffer, sizeof(Buffer), "SDMC: Read failed, state %d, status %08x, result %d\n", Context->State, Status, Result);
+		HalDisplayString(Buffer);
+#endif
+		
+		// Free the map buffer.
+		SdmcpSectorIoFreeMapBuffer(Context);
+		
+		SdmcpSectorIoAsyncDeSelect(Status, Context);
+		return;
+	}
+	
+	
+	PUCHAR Pointer = (PUCHAR)Context->Buffer;
+	if (Context->State == LOCK_STATE_FIRST_PAGE || Context->State == LOCK_STATE_NEXT_PAGE || Context->State == LOCK_STATE_LAST_PAGE) {
+		if (Context->State == LOCK_STATE_FIRST_PAGE) {
+			// Executing on CPU 0.
+			// If caller passed an MDL, ensure that it is mapped.
+			if (Context->Mdl != NULL) {
+				PUCHAR MdlBuffer = (PUCHAR)MmGetSystemAddressForMdl(Context->Mdl);
+				if (MdlBuffer == NULL) {
+					SdmcpSectorIoAsyncDeSelect(STATUS_UNSUCCESSFUL, Context);
+					return;
+				}
+				
+				// MDL is mapped. Fix the buffer.
+				Context->Buffer = (PVOID)&MdlBuffer[(ULONG)Context->Buffer];
+				Pointer = (PUCHAR)Context->Buffer;
+			}
+			
+			if (Context->DmaBuffer == NULL) {
+				// Allocate a clear map buffer.
+				KeAcquireSpinLockAtDpcLevel(&s_SdmcDmaMapLock);
+				ULONG BufferPage = RtlFindClearBitsAndSet(&s_SdmcDmaMap, 1, 0);
+				KeReleaseSpinLockFromDpcLevel(&s_SdmcDmaMapLock);
+				if (BufferPage == 0xFFFFFFFF) {
+					SdmcpSectorIoAsyncDeSelect(STATUS_INSUFFICIENT_RESOURCES, Context);
+					return;
+				}
+				Context->DmaBuffer = (PUCHAR)s_SdmcDmaBuffer + (BufferPage * PAGE_SIZE);
+				Context->BufferPage = BufferPage;
+			}
+		} else {
+			// Swap64 from the map buffer into the original buffer.
+			ULONG IoCount = Context->IoCount;
+			if (((ULONG)Pointer & 7) == 0) {
+				// Pointer is 64-bit aligned, swap from the DMA buffer copying into the buffer.
+				endian_swap64(Pointer, Context->DmaBuffer, SDMC_SECTOR_SIZE * IoCount);
+			}
+			else {
+				endian_swap64(Context->DmaBuffer, Context->DmaBuffer, SDMC_SECTOR_SIZE * IoCount);
+				RtlCopyMemory(Pointer, Context->DmaBuffer, SDMC_SECTOR_SIZE * IoCount);
+			}
+			sync_before_exec(Pointer, SDMC_SECTOR_SIZE * IoCount);
+			
+			Pointer += SDMC_SECTOR_SIZE * IoCount;
+			Context->Sector += IoCount;
+			Context->Count -= IoCount;
+		}
+		
+		if (Context->State == LOCK_STATE_LAST_PAGE || Context->Count == 0) {
+			// Free the map buffer.
+			SdmcpSectorIoFreeMapBuffer(Context);
+			
+			SdmcpSectorIoAsyncDeSelect(Status, Context);
+			return;
+		}
+		
+		// Calculate the parameters for the next read operation.
+		ULONG Offset = Context->Sector;
+		if (s_SdmcIsHighCapacity == FALSE) Offset *= SDMC_SECTOR_SIZE;
+		ULONG IoCount = SDMC_SECTORS_IN_PAGE;
+		if (Context->Count < SDMC_SECTORS_IN_PAGE) IoCount = Context->Count;
+		Context->IoCount = IoCount;
+		Context->Buffer = Pointer;
+		
+		if (IoCount == Context->Count) Context->State = LOCK_STATE_LAST_PAGE;
+		else Context->State = LOCK_STATE_NEXT_PAGE;
+		
+		Status = SdmcpSendCommandAsync(
+			SDIO_CMD_READMULTIBLOCK,
+			SDIO_TYPE_CMD,
+			SDIO_RESPONSE_R1,
+			Offset,
+			IoCount,
+			SDMC_SECTOR_SIZE,
+			Context->DmaBuffer,
+			(IOP_CALLBACK)SdmcpReadSectorsLockedAsync,
+			Context
+		);
+		
+		if (!NT_SUCCESS(Status)) {
+			// Previous call did not succeed.
+			
+			// Free the map buffer.
+			SdmcpSectorIoFreeMapBuffer(Context);
+			
+			SdmcpSectorIoAsyncDeSelect(Status, Context);
+			return;
+		}
+		
+		return;
+	}
+	
+	// Unknown state?
+	// Free the map buffer, if needed.
+	SdmcpSectorIoFreeMapBuffer(Context);
+	
+	SdmcpSectorIoAsyncDeSelect(STATUS_UNSUCCESSFUL, Context);
+}
+
+static NTSTATUS SdmcpReadSectorsLockedSync(ULONG Sector, ULONG NumSector, PVOID Buffer, PMDL Mdl) {
+	// If MDL is non-null, fix up the buffer.
+	if (Mdl != NULL) {
+		PUCHAR MdlBuffer = (PUCHAR)MmGetSystemAddressForMdl(Mdl);
+		if (MdlBuffer == NULL) return STATUS_UNSUCCESSFUL;
+		Buffer = (PVOID)&MdlBuffer[(ULONG)Buffer];
+	} else if (Buffer == NULL) return STATUS_INVALID_PARAMETER;
+	
 	NTSTATUS Status = SdmcpSelect();
 	if (!NT_SUCCESS(Status)) {
 		return Status;
@@ -928,7 +1361,7 @@ static NTSTATUS SdmcpReadSectorsLockedImpl(ULONG Sector, ULONG NumSector, PVOID 
 			endian_swap64(DmaBuffer, DmaBuffer, SDMC_SECTOR_SIZE * IoCount);
 			RtlCopyMemory(Pointer, DmaBuffer, SDMC_SECTOR_SIZE * IoCount);
 		}
-		HalSweepDcacheRange(Pointer, SDMC_SECTOR_SIZE * IoCount);
+		sync_before_exec(Pointer, SDMC_SECTOR_SIZE * IoCount);
 		Pointer += SDMC_SECTOR_SIZE * IoCount;
 		Sector += IoCount;
 		NumSector -= IoCount;
@@ -947,12 +1380,22 @@ static NTSTATUS SdmcpReadSectorsLockedImpl(ULONG Sector, ULONG NumSector, PVOID 
 }
 
 static void SdmcpReadSectorsLocked(PSDMC_LOCK_CONTEXT Context) {
-	Context->Status = SdmcpReadSectorsLockedImpl(Context->Sector, Context->Count, Context->Buffer);
+	#if 0
+	if (*KeNumberProcessors > 1) {
+		// Multiprocessor system.
+		// Start the asynchronous operation by CPU 0, and wait for it to complete.
+		SdmcpReadSectorsLockedAsync(STATUS_SUCCESS, 0, Context);
+		KeWaitForSingleObject( &Context->Event, Executive, KernelMode, FALSE, NULL);
+		return;
+	}
+	#endif
+	Context->Status = SdmcpReadSectorsLockedSync(Context->Sector, Context->Count, Context->Buffer, Context->Mdl);
 	KeSetEvent(&Context->Event, (KPRIORITY)0, FALSE);
 }
 
-NTSTATUS SdmcReadSectors(ULONG Sector, ULONG NumSector, PVOID Buffer) {
-	if (Buffer == NULL) return STATUS_INVALID_PARAMETER;
+NTSTATUS SdmcReadSectors(ULONG Sector, ULONG NumSector, PVOID Buffer, PMDL Mdl) {
+	if (Mdl == NULL && Buffer == NULL) return STATUS_INVALID_PARAMETER;
+	if (Mdl != NULL && (ULONG)Buffer >= Mdl->ByteCount) return STATUS_INVALID_PARAMETER;
 	if (NumSector == 0) return STATUS_SUCCESS;
 	
 	PSDMC_LOCK_CONTEXT Context = SdmcpGetStateContext();
@@ -961,6 +1404,7 @@ NTSTATUS SdmcReadSectors(ULONG Sector, ULONG NumSector, PVOID Buffer) {
 	Context->Sector = Sector;
 	Context->Count = NumSector;
 	Context->Buffer = Buffer;
+	Context->Mdl = Mdl;
 	
 	NTSTATUS Status = SdmcpLockController(SdmcpReadSectorsLocked, Context);
 	if (!NT_SUCCESS(Status)) {
@@ -974,8 +1418,146 @@ NTSTATUS SdmcReadSectors(ULONG Sector, ULONG NumSector, PVOID Buffer) {
 	return Status;
 }
 
-static NTSTATUS SdmcpWriteSectorsLockedImpl(ULONG Sector, ULONG NumSector, const void* Buffer) {
-	if (Buffer == NULL) return STATUS_INVALID_PARAMETER;
+static void SdmcpWriteSectorsLockedAsync(NTSTATUS Status, ULONG Result, PSDMC_LOCK_CONTEXT Context) {
+	// Async is used on a multiprocessor system, writing from MDL.
+	// This ensures all accesses through an MDL do use CPU 0 exclusively, which is where all IOP requests end up.
+	if (Context->State == LOCK_STATE_SELECT) {
+		// First SdmcpSelect async. On success, the callback will execute on CPU 0 in DPC context.
+		Context->State = LOCK_STATE_FIRST_PAGE;
+		Status = SdmcpSelectAsync((IOP_CALLBACK)SdmcpWriteSectorsLockedAsync, Context);
+		if (!NT_SUCCESS(Status)) {
+			Context->Status = Status;
+			KeSetEvent(&Context->Event, (KPRIORITY)0, FALSE);
+		}
+		return;
+	}
+	
+	if (Context->State == LOCK_STATE_FINISHED) {
+		// Callback from final SdmcpDeSelectAsync.
+		// Should never get here, as the read implementation is used instead (it's the same, for both read and write)
+		// Assume Context->Status was already set in a previous callback.
+		// Set the finalise event and return.
+		KeSetEvent(&Context->Event, (KPRIORITY)0, FALSE);
+		return;
+	}
+	
+	if (!NT_SUCCESS(Status)) {
+		// Previous call did not succeed.
+		
+		// Free the map buffer.
+		SdmcpSectorIoFreeMapBuffer(Context);
+		
+		SdmcpSectorIoAsyncDeSelect(Status, Context);
+		return;
+	}
+	
+	
+	PUCHAR Pointer = (PUCHAR)Context->Buffer;
+	if (Context->State == LOCK_STATE_FIRST_PAGE || Context->State == LOCK_STATE_NEXT_PAGE || Context->State == LOCK_STATE_LAST_PAGE) {
+		if (Context->State == LOCK_STATE_FIRST_PAGE) {
+			// Executing on CPU 0.
+			// If caller passed an MDL, ensure that it is mapped.
+			if (Context->Mdl != NULL) {
+				PUCHAR MdlBuffer = (PUCHAR)MmGetSystemAddressForMdl(Context->Mdl);
+				if (MdlBuffer == NULL) {
+					SdmcpSectorIoAsyncDeSelect(STATUS_UNSUCCESSFUL, Context);
+					return;
+				}
+				
+				// MDL is mapped. Fix the buffer.
+				Context->Buffer = (PVOID)&MdlBuffer[(ULONG)Context->Buffer];
+				Pointer = (PUCHAR)Context->Buffer;
+			}
+			
+			if (Context->DmaBuffer == NULL) {
+				// Allocate a clear map buffer.
+				KeAcquireSpinLockAtDpcLevel(&s_SdmcDmaMapLock);
+				ULONG BufferPage = RtlFindClearBitsAndSet(&s_SdmcDmaMap, 1, 0);
+				KeReleaseSpinLockFromDpcLevel(&s_SdmcDmaMapLock);
+				if (BufferPage == 0xFFFFFFFF) {
+					SdmcpSectorIoAsyncDeSelect(STATUS_INSUFFICIENT_RESOURCES, Context);
+					return;
+				}
+				Context->DmaBuffer = (PUCHAR)s_SdmcDmaBuffer + (BufferPage * PAGE_SIZE);
+				Context->BufferPage = BufferPage;
+			}
+		} else {
+			ULONG IoCount = Context->IoCount;
+			Pointer += SDMC_SECTOR_SIZE * IoCount;
+			Context->Sector += IoCount;
+			Context->Count -= IoCount;
+		}
+		
+		if (Context->State == LOCK_STATE_LAST_PAGE || Context->Count == 0) {
+			// Free the map buffer.
+			SdmcpSectorIoFreeMapBuffer(Context);
+			
+			SdmcpSectorIoAsyncDeSelect(Status, Context);
+			return;
+		}
+		
+		// Calculate the parameters for the next read operation.
+		ULONG Offset = Context->Sector;
+		if (s_SdmcIsHighCapacity == FALSE) Offset *= SDMC_SECTOR_SIZE;
+		ULONG IoCount = SDMC_SECTORS_IN_PAGE;
+		if (Context->Count < SDMC_SECTORS_IN_PAGE) IoCount = Context->Count;
+		Context->IoCount = IoCount;
+		Context->Buffer = Pointer;
+		
+		// Swap64 from the original buffer into the map buffer.
+		if (((ULONG)Pointer & 7) == 0) {
+			// Pointer is 64-bit aligned, swap from the pointer directly into the DMA buffer
+			endian_swap64(Context->DmaBuffer, Pointer, SDMC_SECTOR_SIZE * IoCount);
+		}
+		else {
+			// Not 64-bit aligned, copy then swap.
+			RtlCopyMemory(Context->DmaBuffer, Pointer, SDMC_SECTOR_SIZE * IoCount);
+			endian_swap64(Context->DmaBuffer, Context->DmaBuffer, SDMC_SECTOR_SIZE * IoCount);
+		}
+		// Cache invalidation not needed as IOP PXI driver does that.
+		
+		if (IoCount == Context->Count) Context->State = LOCK_STATE_LAST_PAGE;
+		else Context->State = LOCK_STATE_NEXT_PAGE;
+		
+		Status = SdmcpSendCommandAsync(
+			SDIO_CMD_WRITEMULTIBLOCK,
+			SDIO_TYPE_CMD,
+			SDIO_RESPONSE_R1,
+			Offset,
+			IoCount,
+			SDMC_SECTOR_SIZE,
+			Context->DmaBuffer,
+			(IOP_CALLBACK)SdmcpWriteSectorsLockedAsync,
+			Context
+		);
+		
+		if (!NT_SUCCESS(Status)) {
+			// Previous call did not succeed.
+			
+			// Free the map buffer.
+			SdmcpSectorIoFreeMapBuffer(Context);
+			
+			SdmcpSectorIoAsyncDeSelect(Status, Context);
+			return;
+		}
+		
+		return;
+	}
+	
+	// Unknown state?
+	// Free the map buffer, if needed.
+	SdmcpSectorIoFreeMapBuffer(Context);
+	
+	SdmcpSectorIoAsyncDeSelect(STATUS_UNSUCCESSFUL, Context);
+}
+
+static NTSTATUS SdmcpWriteSectorsLockedSync(ULONG Sector, ULONG NumSector, const void* Buffer, PMDL Mdl) {
+	// If MDL is non-null, fix up the buffer.
+	if (Mdl != NULL) {
+		PUCHAR MdlBuffer = (PUCHAR)MmGetSystemAddressForMdl(Mdl);
+		if (MdlBuffer == NULL) return STATUS_UNSUCCESSFUL;
+		Buffer = (PVOID)&MdlBuffer[(ULONG)Buffer];
+	} else if (Buffer == NULL) return STATUS_INVALID_PARAMETER;
 	
 	NTSTATUS Status = SdmcpSelect();
 	if (!NT_SUCCESS(Status)) return Status;
@@ -1054,12 +1636,22 @@ static NTSTATUS SdmcpWriteSectorsLockedImpl(ULONG Sector, ULONG NumSector, const
 }
 
 static void SdmcpWriteSectorsLocked(PSDMC_LOCK_CONTEXT Context) {
-	Context->Status = SdmcpWriteSectorsLockedImpl(Context->Sector, Context->Count, Context->Buffer);
+	#if 0
+	if (*KeNumberProcessors > 1) {
+		// Multiprocessor system.
+		// Start the asynchronous operation by CPU 0, and wait for it to complete.
+		SdmcpWriteSectorsLockedAsync(STATUS_SUCCESS, 0, Context);
+		KeWaitForSingleObject( &Context->Event, Executive, KernelMode, FALSE, NULL);
+		return;
+	}
+	#endif
+	Context->Status = SdmcpWriteSectorsLockedSync(Context->Sector, Context->Count, Context->Buffer, Context->Mdl);
 	KeSetEvent(&Context->Event, (KPRIORITY)0, FALSE);
 }
 
-NTSTATUS SdmcWriteSectors(ULONG Sector, ULONG NumSector, const void* Buffer) {
-	if (Buffer == NULL) return STATUS_INVALID_PARAMETER;
+NTSTATUS SdmcWriteSectors(ULONG Sector, ULONG NumSector, const void* Buffer, PMDL Mdl) {
+	if (Mdl == NULL && Buffer == NULL) return STATUS_INVALID_PARAMETER;
+	if (Mdl != NULL && (ULONG)Buffer >= Mdl->ByteCount) return STATUS_INVALID_PARAMETER;
 	if (NumSector == 0) return STATUS_SUCCESS;
 	
 	PSDMC_LOCK_CONTEXT Context = SdmcpGetStateContext();
@@ -1067,7 +1659,8 @@ NTSTATUS SdmcWriteSectors(ULONG Sector, ULONG NumSector, const void* Buffer) {
 	
 	Context->Sector = Sector;
 	Context->Count = NumSector;
-	Context->Buffer = Buffer;
+	Context->Buffer = (PVOID)Buffer;
+	Context->Mdl = Mdl;
 	
 	NTSTATUS Status = SdmcpLockController(SdmcpWriteSectorsLocked, Context);
 	if (!NT_SUCCESS(Status)) {
@@ -1079,6 +1672,863 @@ NTSTATUS SdmcWriteSectors(ULONG Sector, ULONG NumSector, const void* Buffer) {
 	Status = Context->Status;
 	SdmcpReleaseStateContext(Context);
 	return Status;
+}
+
+NTSTATUS SdmcLowDiskRw(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+	// Start the pending operation.
+	Irp->IoStatus.Information = 0;
+	IoMarkIrpPending(Irp);
+	ULONG Key = 0;
+	// Flush to cache.
+	sync_before_exec_this_cpu(Irp, sizeof(*Irp) + sizeof(IO_STACK_LOCATION));
+	IoStartPacket(DeviceObject, Irp, &Key, NULL);
+	return STATUS_PENDING;
+}
+
+NTSTATUS SdmcLowDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+	PIO_STACK_LOCATION Stack = IoGetCurrentIrpStackLocation(Irp);
+	NTSTATUS Status = STATUS_SUCCESS;
+	ULONG LenIn = Stack->Parameters.DeviceIoControl.InputBufferLength;
+	ULONG LenOut = Stack->Parameters.DeviceIoControl.OutputBufferLength;
+	ULONG Key = 0;
+	
+	switch (Stack->Parameters.DeviceIoControl.IoControlCode) {
+	case IOCTL_SDMC_GET_STATUS:
+		if (LenOut < sizeof(ULONG)) {
+				Status = STATUS_INVALID_PARAMETER;
+				break;
+		}
+		Irp->IoStatus.Information = 0;
+		IoMarkIrpPending(Irp);
+		sync_before_exec_this_cpu(Irp, sizeof(*Irp) + sizeof(IO_STACK_LOCATION));
+		IoStartPacket(DeviceObject, Irp, &Key, NULL);
+		return STATUS_PENDING;
+	default:
+		Status = STATUS_INVALID_DEVICE_REQUEST;
+		break;
+	}
+	
+	Irp->IoStatus.Status = Status;
+	IoCompleteRequest(Irp, IO_NO_INCREMENT);
+	return Status;
+}
+
+static void SdmcpLowFinishPacket(PSDMC_SEIZED_CONTEXT Context) {
+	PSDMC_LOWLEVEL_EXTENSION Ext = (PSDMC_LOWLEVEL_EXTENSION)Context->DeviceObject->DeviceExtension;
+	// Get the used variables from the context, following calls may overwrite them.
+	PIRP Irp = Context->Irp;
+	PDEVICE_OBJECT DeviceObject = Context->DeviceObject;
+	PCONTROLLER_OBJECT ControllerObject = Context->DiskController;
+	sync_before_exec_this_cpu(Irp, sizeof(*Irp));
+	// Complete the IRP.
+	IoCompleteRequest(Irp, IO_DISK_INCREMENT);
+	// Free the controller, and let any pending IRPs proceed.
+#if 0
+	{
+		char Buffer[1024];
+		_snprintf(Buffer, sizeof(Buffer), "(%08x)\n", ControllerObject);
+		HalDisplayString(Buffer);
+	}
+#endif
+	IoFreeController(ControllerObject);
+	// Start next IRP request.
+	IoStartNextPacket(DeviceObject, FALSE);
+}
+
+static void SdmcpReadSectorsSeizedAsync(NTSTATUS Status, ULONG Result, PSDMC_SEIZED_CONTEXT Context);
+static void SdmcpLowAsyncDeSelect(NTSTATUS Status, PSDMC_SEIZED_CONTEXT Context) {
+	// Set the returning status.
+	Context->Irp->IoStatus.Status = Status;
+		
+	// Deselect the SD card.
+	Context->State = LOCK_STATE_FINISHED;
+	Status = SdmcpDeSelectAsync((IOP_CALLBACK)SdmcpReadSectorsSeizedAsync, Context);
+	if (!NT_SUCCESS(Status)) {
+		SdmcpLowFinishPacket(Context);
+	}
+}
+
+static void SdmcpLowFreeMapBuffer(PSDMC_SEIZED_CONTEXT Context) {
+	if (Context->DmaBuffer == NULL) return;
+	KeAcquireSpinLockAtDpcLevel(&s_SdmcDmaMapLock);
+	RtlClearBits(&s_SdmcDmaMap, Context->BufferPage, 1);
+	Context->DmaBuffer = NULL;
+	KeReleaseSpinLockFromDpcLevel(&s_SdmcDmaMapLock);
+}
+
+static void SdmcpReadSectorsSeizedAsync(NTSTATUS Status, ULONG Result, PSDMC_SEIZED_CONTEXT Context) {
+	// Async is used on a multiprocessor system, reading into MDL.
+	// This ensures all accesses through an MDL do use CPU 0 exclusively, which is where all IOP requests end up.
+	if (Context->State == LOCK_STATE_SELECT) {
+		// First SdmcpSelect async. On success, the callback will execute on CPU 0 in DPC context.
+		Context->State = LOCK_STATE_FIRST_PAGE;
+		Status = SdmcpSelectAsync((IOP_CALLBACK)SdmcpReadSectorsSeizedAsync, Context);
+		if (!NT_SUCCESS(Status)) {
+			Context->Irp->IoStatus.Status = Status;
+			SdmcpLowFinishPacket(Context);
+		}
+		return;
+	}
+	
+	if (Context->State == LOCK_STATE_FINISHED) {
+		// Callback from final SdmcpDeSelectAsync.
+		// Assume Context->Status was already set in a previous callback.
+		// Set the finalise event and return.
+		SdmcpLowFinishPacket(Context);
+		return;
+	}
+	
+	if (!NT_SUCCESS(Status)) {
+		// Previous call did not succeed.
+#if 0
+		char Buffer[1024];
+		_snprintf(Buffer, sizeof(Buffer), "SDMC: Read failed, state %d, status %08x, result %d\n", Context->State, Status, Result);
+		HalDisplayString(Buffer);
+#endif
+		
+		// Free the map buffer.
+		SdmcpLowFreeMapBuffer(Context);
+		
+		SdmcpLowAsyncDeSelect(Status, Context);
+		return;
+	}
+	
+	
+	PUCHAR Pointer = (PUCHAR)Context->Buffer;
+	if (Context->State == LOCK_STATE_FIRST_PAGE || Context->State == LOCK_STATE_NEXT_PAGE || Context->State == LOCK_STATE_LAST_PAGE) {
+		if (Context->State == LOCK_STATE_FIRST_PAGE) {
+			// Executing on CPU 0.
+			// If caller passed an MDL, ensure that it is mapped.
+			if (Context->Mdl != NULL) {
+				PUCHAR MdlBuffer = (PUCHAR)MmGetSystemAddressForMdl(Context->Mdl);
+				if (MdlBuffer == NULL) {
+					SdmcpLowAsyncDeSelect(STATUS_UNSUCCESSFUL, Context);
+					return;
+				}
+				
+				// MDL is mapped. Fix the buffer.
+				Context->Buffer = (PVOID)&MdlBuffer[(ULONG)Context->Buffer];
+				Pointer = (PUCHAR)Context->Buffer;
+			}
+			
+			if (Context->DmaBuffer == NULL) {
+				// Allocate a clear map buffer.
+				KeAcquireSpinLockAtDpcLevel(&s_SdmcDmaMapLock);
+				ULONG BufferPage = RtlFindClearBitsAndSet(&s_SdmcDmaMap, 1, 0);
+				KeReleaseSpinLockFromDpcLevel(&s_SdmcDmaMapLock);
+				if (BufferPage == 0xFFFFFFFF) {
+					SdmcpLowAsyncDeSelect(STATUS_INSUFFICIENT_RESOURCES, Context);
+					return;
+				}
+				Context->DmaBuffer = (PUCHAR)s_SdmcDmaBuffer + (BufferPage * PAGE_SIZE);
+				Context->BufferPage = BufferPage;
+			}
+		} else {
+			// Swap64 from the map buffer into the original buffer.
+			ULONG IoCount = Context->IoCount;
+			if (((ULONG)Pointer & 7) == 0) {
+				// Pointer is 64-bit aligned, swap from the DMA buffer copying into the buffer.
+				endian_swap64(Pointer, Context->DmaBuffer, SDMC_SECTOR_SIZE * IoCount);
+			}
+			else {
+				endian_swap64(Context->DmaBuffer, Context->DmaBuffer, SDMC_SECTOR_SIZE * IoCount);
+				RtlCopyMemory(Pointer, Context->DmaBuffer, SDMC_SECTOR_SIZE * IoCount);
+			}
+			sync_before_exec(Pointer, SDMC_SECTOR_SIZE * IoCount);
+			
+			Pointer += SDMC_SECTOR_SIZE * IoCount;
+			Context->Sector += IoCount;
+			Context->Count -= IoCount;
+			Context->Irp->IoStatus.Information += IoCount;
+		}
+		
+		if (Context->State == LOCK_STATE_LAST_PAGE || Context->Count == 0) {
+			// Free the map buffer.
+			SdmcpLowFreeMapBuffer(Context);
+			
+			SdmcpLowAsyncDeSelect(Status, Context);
+			return;
+		}
+		
+		// Calculate the parameters for the next read operation.
+		ULONG Offset = Context->Sector;
+		if (s_SdmcIsHighCapacity == FALSE) Offset *= SDMC_SECTOR_SIZE;
+		ULONG IoCount = SDMC_SECTORS_IN_PAGE;
+		if (Context->Count < SDMC_SECTORS_IN_PAGE) IoCount = Context->Count;
+		Context->IoCount = IoCount;
+		Context->Buffer = Pointer;
+		
+		if (IoCount == Context->Count) Context->State = LOCK_STATE_LAST_PAGE;
+		else Context->State = LOCK_STATE_NEXT_PAGE;
+		
+		Status = SdmcpSendCommandAsync(
+			SDIO_CMD_READMULTIBLOCK,
+			SDIO_TYPE_CMD,
+			SDIO_RESPONSE_R1,
+			Offset,
+			IoCount,
+			SDMC_SECTOR_SIZE,
+			Context->DmaBuffer,
+			(IOP_CALLBACK)SdmcpReadSectorsSeizedAsync,
+			Context
+		);
+		
+		if (!NT_SUCCESS(Status)) {
+			// Previous call did not succeed.
+			
+			// Free the map buffer.
+			SdmcpLowFreeMapBuffer(Context);
+			
+			SdmcpLowAsyncDeSelect(Status, Context);
+			return;
+		}
+		
+		return;
+	}
+	
+	// Unknown state?
+	// Free the map buffer, if needed.
+	SdmcpLowFreeMapBuffer(Context);
+	
+	SdmcpLowAsyncDeSelect(STATUS_UNSUCCESSFUL, Context);
+}
+
+static void SdmcpWriteSectorsSeizedAsync(NTSTATUS Status, ULONG Result, PSDMC_SEIZED_CONTEXT Context) {
+	// Async is used on a multiprocessor system, writing from MDL.
+	// This ensures all accesses through an MDL do use CPU 0 exclusively, which is where all IOP requests end up.
+	if (Context->State == LOCK_STATE_SELECT) {
+		// First SdmcpSelect async. On success, the callback will execute on CPU 0 in DPC context.
+		Context->State = LOCK_STATE_FIRST_PAGE;
+		Status = SdmcpSelectAsync((IOP_CALLBACK)SdmcpWriteSectorsSeizedAsync, Context);
+		if (!NT_SUCCESS(Status)) {
+			Context->Irp->IoStatus.Status = Status;
+			SdmcpLowFinishPacket(Context);
+		}
+		return;
+	}
+	
+	if (Context->State == LOCK_STATE_FINISHED) {
+		// Callback from final SdmcpDeSelectAsync.
+		// Should never get here, as the read implementation is used instead (it's the same, for both read and write)
+		// Assume Context->Status was already set in a previous callback.
+		// Set the finalise event and return.
+		SdmcpLowFinishPacket(Context);
+		return;
+	}
+	
+	if (!NT_SUCCESS(Status)) {
+		// Previous call did not succeed.
+		
+		// Free the map buffer.
+		SdmcpLowFreeMapBuffer(Context);
+		
+		SdmcpLowAsyncDeSelect(Status, Context);
+		return;
+	}
+	
+	
+	PUCHAR Pointer = (PUCHAR)Context->Buffer;
+	if (Context->State == LOCK_STATE_FIRST_PAGE || Context->State == LOCK_STATE_NEXT_PAGE || Context->State == LOCK_STATE_LAST_PAGE) {
+		if (Context->State == LOCK_STATE_FIRST_PAGE) {
+			// Executing on CPU 0.
+			// If caller passed an MDL, ensure that it is mapped.
+			if (Context->Mdl != NULL) {
+				PUCHAR MdlBuffer = (PUCHAR)MmGetSystemAddressForMdl(Context->Mdl);
+				if (MdlBuffer == NULL) {
+					SdmcpLowAsyncDeSelect(STATUS_UNSUCCESSFUL, Context);
+					return;
+				}
+				
+				// MDL is mapped. Fix the buffer.
+				Context->Buffer = (PVOID)&MdlBuffer[(ULONG)Context->Buffer];
+				Pointer = (PUCHAR)Context->Buffer;
+			}
+			
+			if (Context->DmaBuffer == NULL) {
+				// Allocate a clear map buffer.
+				KeAcquireSpinLockAtDpcLevel(&s_SdmcDmaMapLock);
+				ULONG BufferPage = RtlFindClearBitsAndSet(&s_SdmcDmaMap, 1, 0);
+				KeReleaseSpinLockFromDpcLevel(&s_SdmcDmaMapLock);
+				if (BufferPage == 0xFFFFFFFF) {
+					SdmcpLowAsyncDeSelect(STATUS_INSUFFICIENT_RESOURCES, Context);
+					return;
+				}
+				Context->DmaBuffer = (PUCHAR)s_SdmcDmaBuffer + (BufferPage * PAGE_SIZE);
+				Context->BufferPage = BufferPage;
+			}
+		} else {
+			ULONG IoCount = Context->IoCount;
+			Pointer += SDMC_SECTOR_SIZE * IoCount;
+			Context->Sector += IoCount;
+			Context->Count -= IoCount;
+			Context->Irp->IoStatus.Information += IoCount;
+		}
+		
+		if (Context->State == LOCK_STATE_LAST_PAGE || Context->Count == 0) {
+			// Free the map buffer.
+			SdmcpLowFreeMapBuffer(Context);
+			
+			SdmcpLowAsyncDeSelect(Status, Context);
+			return;
+		}
+		
+		// Calculate the parameters for the next read operation.
+		ULONG Offset = Context->Sector;
+		if (s_SdmcIsHighCapacity == FALSE) Offset *= SDMC_SECTOR_SIZE;
+		ULONG IoCount = SDMC_SECTORS_IN_PAGE;
+		if (Context->Count < SDMC_SECTORS_IN_PAGE) IoCount = Context->Count;
+		Context->IoCount = IoCount;
+		Context->Buffer = Pointer;
+		
+		// Swap64 from the original buffer into the map buffer.
+		if (((ULONG)Pointer & 7) == 0) {
+			// Pointer is 64-bit aligned, swap from the pointer directly into the DMA buffer
+			endian_swap64(Context->DmaBuffer, Pointer, SDMC_SECTOR_SIZE * IoCount);
+		}
+		else {
+			// Not 64-bit aligned, copy then swap.
+			RtlCopyMemory(Context->DmaBuffer, Pointer, SDMC_SECTOR_SIZE * IoCount);
+			endian_swap64(Context->DmaBuffer, Context->DmaBuffer, SDMC_SECTOR_SIZE * IoCount);
+		}
+		// Cache invalidation not needed as IOP PXI driver does that.
+		
+		if (IoCount == Context->Count) Context->State = LOCK_STATE_LAST_PAGE;
+		else Context->State = LOCK_STATE_NEXT_PAGE;
+		
+		Status = SdmcpSendCommandAsync(
+			SDIO_CMD_WRITEMULTIBLOCK,
+			SDIO_TYPE_CMD,
+			SDIO_RESPONSE_R1,
+			Offset,
+			IoCount,
+			SDMC_SECTOR_SIZE,
+			Context->DmaBuffer,
+			(IOP_CALLBACK)SdmcpWriteSectorsSeizedAsync,
+			Context
+		);
+		
+		if (!NT_SUCCESS(Status)) {
+			// Previous call did not succeed.
+			
+			// Free the map buffer.
+			SdmcpLowFreeMapBuffer(Context);
+			
+			SdmcpLowAsyncDeSelect(Status, Context);
+			return;
+		}
+		
+		return;
+	}
+	
+	// Unknown state?
+	// Free the map buffer, if needed.
+	SdmcpLowFreeMapBuffer(Context);
+	
+	SdmcpLowAsyncDeSelect(STATUS_UNSUCCESSFUL, Context);
+}
+
+void SdmcpReadSectorsArrSeizedAsync(NTSTATUS Status, ULONG Result, PSDMC_SECTARR_SEIZED_CONTEXT ContextArr) {
+	// Async is used on a multiprocessor system, reading into MDL.
+	// This ensures all accesses through an MDL do use CPU 0 exclusively, which is where all IOP requests end up.
+	PSDMC_SEIZED_CONTEXT Context = &ContextArr->Base;
+	
+	if (Context->State == LOCK_STATE_STATUS) {
+#if 0
+		char Buffer[1024];
+		_snprintf(Buffer, sizeof(Buffer), "SDMC: LowRead %08x(%d)\n", Context->Sector, ContextArr->Length);
+		HalDisplayString(Buffer);
+#endif
+		sync_before_exec_this_cpu(Context->Irp, sizeof(*Context->Irp) + sizeof(IO_STACK_LOCATION));
+		// Sdmc GetStatus. The callback will execute on CPU 0 in DPC context.
+		Context->State = LOCK_STATE_SELECT;
+		Status = HalIopIoctlAsyncDpc(
+			s_hIosSdmc,
+			IOCTL_SDIO_GETSTATUS,
+			NULL,
+			0,
+			ContextArr->StatusPtr,
+			sizeof(ULONG),
+			IOCTL_SWAP_NONE,
+			IOCTL_SWAP_NONE,
+			(IOP_CALLBACK)SdmcpReadSectorsArrSeizedAsync,
+			Context
+		);
+		if (!NT_SUCCESS(Status)) {
+			Context->Irp->IoStatus.Status = Status;
+			SdmcpLowFinishPacket(Context);
+		}
+		return;
+	}
+#if 0
+	{
+		char Buffer[1024];
+		_snprintf(Buffer, sizeof(Buffer), "%d", Context->State);
+		HalDisplayString(Buffer);
+	}
+#endif
+	
+	if (Context->State == LOCK_STATE_SELECT) {
+		if (!NT_SUCCESS(Status)) {
+			HalDisplayString("x\n");
+			Context->Irp->IoStatus.Status = Status;
+			SdmcpLowFinishPacket(Context);
+			return;
+		}
+		// First SdmcpSelect async. On success, the callback will execute on CPU 0 in DPC context.
+		// Check the GetStatus return first.
+		ULONG CardStatus = ContextArr->StatusPtr[1];
+		HalIopFree(ContextArr->StatusPtr);
+		if ((CardStatus & SDIO_STATUS_CARD_INSERTED) == 0) {
+			// Device not ready.
+			Context->Irp->IoStatus.Status = STATUS_DEVICE_NOT_READY;
+			SdmcpLowFinishPacket(Context);
+			return;
+		}
+		if ((CardStatus & SDIO_STATUS_CARD_WRITEPROT) != 0) {
+			// Write protect. This is read so it doesn't matter, but for write it would.
+		}
+		
+		Context->State = LOCK_STATE_FIRST_PAGE;
+		Status = SdmcpSelectAsync((IOP_CALLBACK)SdmcpReadSectorsArrSeizedAsync, Context);
+		if (!NT_SUCCESS(Status)) {
+			Context->Irp->IoStatus.Status = Status;
+			SdmcpLowFinishPacket(Context);
+		}
+		return;
+	}
+	
+	if (Context->State == LOCK_STATE_FINISHED) {
+		// Callback from final SdmcpDeSelectAsync.
+		// Assume Context->Status was already set in a previous callback.
+		// Set the finalise event and return.
+		SdmcpLowFinishPacket(Context);
+		return;
+	}
+	
+	if (!NT_SUCCESS(Status)) {
+		// Previous call did not succeed.
+#if 0
+		char Buffer[1024];
+		_snprintf(Buffer, sizeof(Buffer), "SDMC: Read failed, state %d, status %08x, result %d\n", Context->State, Status, Result);
+		HalDisplayString(Buffer);
+#endif
+		
+		// Free the map buffer.
+		SdmcpLowFreeMapBuffer(Context);
+		
+		SdmcpLowAsyncDeSelect(Status, Context);
+		return;
+	}
+	
+	
+	PUCHAR Pointer = (PUCHAR)Context->Buffer;
+	if (Context->State == LOCK_STATE_FIRST_PAGE || Context->State == LOCK_STATE_NEXT_PAGE || Context->State == LOCK_STATE_LAST_PAGE) {
+		if (Context->State == LOCK_STATE_FIRST_PAGE) {
+			// Executing on CPU 0.
+			// If caller passed an MDL, ensure that it is mapped.
+			if (Context->Mdl != NULL) {
+				PUCHAR MdlBuffer = (PUCHAR)MmGetSystemAddressForMdl(Context->Mdl);
+				if (MdlBuffer == NULL) {
+					SdmcpLowAsyncDeSelect(STATUS_UNSUCCESSFUL, Context);
+					return;
+				}
+				
+				// MDL is mapped. Fix the buffer.
+				Context->Buffer = (PVOID)&MdlBuffer[(ULONG)Context->Buffer];
+				Pointer = (PUCHAR)Context->Buffer;
+			}
+			
+			if (Context->DmaBuffer == NULL) {
+				// Allocate a clear map buffer.
+				KeAcquireSpinLockAtDpcLevel(&s_SdmcDmaMapLock);
+				ULONG BufferPage = RtlFindClearBitsAndSet(&s_SdmcDmaMap, 1, 0);
+				KeReleaseSpinLockFromDpcLevel(&s_SdmcDmaMapLock);
+				if (BufferPage == 0xFFFFFFFF) {
+					SdmcpLowAsyncDeSelect(STATUS_INSUFFICIENT_RESOURCES, Context);
+					return;
+				}
+				Context->DmaBuffer = (PUCHAR)s_SdmcDmaBuffer + (BufferPage * PAGE_SIZE);
+				Context->BufferPage = BufferPage;
+			}
+		} else {
+			// Swap64 from the map buffer into the original buffer.
+			ULONG IoCount = Context->IoCount;
+			if (((ULONG)Pointer & 7) == 0) {
+				// Pointer is 64-bit aligned, swap from the DMA buffer copying into the buffer.
+				endian_swap64(Pointer, Context->DmaBuffer, SDMC_SECTOR_SIZE * IoCount);
+			}
+			else {
+				endian_swap64(Context->DmaBuffer, Context->DmaBuffer, SDMC_SECTOR_SIZE * IoCount);
+				RtlCopyMemory(Pointer, Context->DmaBuffer, SDMC_SECTOR_SIZE * IoCount);
+			}
+			sync_before_exec(Pointer, SDMC_SECTOR_SIZE * IoCount);
+			
+			Pointer += SDMC_SECTOR_SIZE * IoCount;
+			Context->Sector += IoCount;
+			Context->Count -= IoCount;
+			Context->Irp->IoStatus.Information += (IoCount * SDMC_SECTOR_SIZE);
+			ContextArr->Length -= IoCount;
+		}
+		
+		if (Context->State == LOCK_STATE_LAST_PAGE || Context->Count == 0) {
+			// This chunk is finished. Is the whole read request finished?
+			if (ContextArr->Length == 0 || ContextArr->SectorTableRemaining == 0) {
+				// Free the map buffer.
+				SdmcpLowFreeMapBuffer(Context);
+				
+#if 0
+				HalDisplayString("y\n");
+#endif
+				SdmcpLowAsyncDeSelect(Status, Context);
+				return;
+			}
+			
+			// Still data to read.
+			Context->State = LOCK_STATE_NEXT_PAGE;
+			ContextArr->Offset = 0;
+			ContextArr->SectorTableEntry++;
+			ContextArr->SectorTableRemaining--;
+			Context->Sector = ContextArr->SectorTableEntry->sector;
+			Context->Count = ContextArr->SectorTableEntry->count;
+		}
+		
+		// Calculate the parameters for the next read operation.
+		ULONG Offset = Context->Sector;
+		if (s_SdmcIsHighCapacity == FALSE) Offset *= SDMC_SECTOR_SIZE;
+		ULONG IoCount = SDMC_SECTORS_IN_PAGE;
+		if (Context->Count < SDMC_SECTORS_IN_PAGE) IoCount = Context->Count;
+		Context->IoCount = IoCount;
+		Context->Buffer = Pointer;
+		
+		if (IoCount == Context->Count) Context->State = LOCK_STATE_LAST_PAGE;
+		else Context->State = LOCK_STATE_NEXT_PAGE;
+		
+		Status = SdmcpSendCommandAsync(
+			SDIO_CMD_READMULTIBLOCK,
+			SDIO_TYPE_CMD,
+			SDIO_RESPONSE_R1,
+			Offset,
+			IoCount,
+			SDMC_SECTOR_SIZE,
+			Context->DmaBuffer,
+			(IOP_CALLBACK)SdmcpReadSectorsArrSeizedAsync,
+			Context
+		);
+		
+		if (!NT_SUCCESS(Status)) {
+			// Previous call did not succeed.
+			
+			// Free the map buffer.
+			SdmcpLowFreeMapBuffer(Context);
+			
+			SdmcpLowAsyncDeSelect(Status, Context);
+			return;
+		}
+		
+		return;
+	}
+	
+	// Unknown state?
+	// Free the map buffer, if needed.
+	SdmcpLowFreeMapBuffer(Context);
+	
+	SdmcpLowAsyncDeSelect(STATUS_UNSUCCESSFUL, Context);
+}
+
+void SdmcpWriteSectorsArrSeizedAsync(NTSTATUS Status, ULONG Result, PSDMC_SECTARR_SEIZED_CONTEXT ContextArr) {
+	// Async is used on a multiprocessor system, writing from MDL.
+	// This ensures all accesses through an MDL do use CPU 0 exclusively, which is where all IOP requests end up.
+	PSDMC_SEIZED_CONTEXT Context = &ContextArr->Base;
+	
+	if (Context->State == LOCK_STATE_STATUS) {
+		// Sdmc GetStatus. The callback will execute on CPU 0 in DPC context.
+		sync_before_exec_this_cpu(Context->Irp, sizeof(*Context->Irp) + sizeof(IO_STACK_LOCATION));
+		Context->State = LOCK_STATE_SELECT;
+		Status = HalIopIoctlAsyncDpc(
+			s_hIosSdmc,
+			IOCTL_SDIO_GETSTATUS,
+			NULL,
+			0,
+			ContextArr->StatusPtr,
+			sizeof(ULONG),
+			IOCTL_SWAP_NONE,
+			IOCTL_SWAP_NONE,
+			(IOP_CALLBACK)SdmcpWriteSectorsArrSeizedAsync,
+			Context
+		);
+		if (!NT_SUCCESS(Status)) {
+			Context->Irp->IoStatus.Status = Status;
+			SdmcpLowFinishPacket(Context);
+		}
+		return;
+	}
+	
+	if (Context->State == LOCK_STATE_SELECT) {
+		if (!NT_SUCCESS(Status)) {
+			Context->Irp->IoStatus.Status = Status;
+			SdmcpLowFinishPacket(Context);
+			return;
+		}
+		// First SdmcpSelect async. On success, the callback will execute on CPU 0 in DPC context.
+		// Check the GetStatus return first.
+		ULONG CardStatus = ContextArr->StatusPtr[1];
+		HalIopFree(ContextArr->StatusPtr);
+		if ((CardStatus & SDIO_STATUS_CARD_INSERTED) == 0) {
+			// Device not ready.
+			Context->Irp->IoStatus.Status = STATUS_DEVICE_NOT_READY;
+			SdmcpLowFinishPacket(Context);
+			return;
+		}
+		if ((CardStatus & SDIO_STATUS_CARD_WRITEPROT) != 0) {
+			// Write protected.
+			Context->Irp->IoStatus.Status = STATUS_MEDIA_WRITE_PROTECTED;
+			SdmcpLowFinishPacket(Context);
+			return;
+		}
+		
+		Context->State = LOCK_STATE_FIRST_PAGE;
+		Status = SdmcpSelectAsync((IOP_CALLBACK)SdmcpWriteSectorsArrSeizedAsync, Context);
+		if (!NT_SUCCESS(Status)) {
+			Context->Irp->IoStatus.Status = Status;
+			SdmcpLowFinishPacket(Context);
+		}
+		return;
+	}
+	
+	if (Context->State == LOCK_STATE_FINISHED) {
+		// Callback from final SdmcpDeSelectAsync.
+		// Should never get here, as the read implementation is used instead (it's the same, for both read and write)
+		// Assume Context->Status was already set in a previous callback.
+		// Set the finalise event and return.
+		SdmcpLowFinishPacket(Context);
+		return;
+	}
+	
+	if (!NT_SUCCESS(Status)) {
+		// Previous call did not succeed.
+		
+		// Free the map buffer.
+		SdmcpLowFreeMapBuffer(Context);
+		
+		SdmcpLowAsyncDeSelect(Status, Context);
+		return;
+	}
+	
+	
+	PUCHAR Pointer = (PUCHAR)Context->Buffer;
+	if (Context->State == LOCK_STATE_FIRST_PAGE || Context->State == LOCK_STATE_NEXT_PAGE || Context->State == LOCK_STATE_LAST_PAGE) {
+		if (Context->State == LOCK_STATE_FIRST_PAGE) {
+			// Executing on CPU 0.
+			// If caller passed an MDL, ensure that it is mapped.
+			if (Context->Mdl != NULL) {
+				PUCHAR MdlBuffer = (PUCHAR)MmGetSystemAddressForMdl(Context->Mdl);
+				if (MdlBuffer == NULL) {
+					SdmcpLowAsyncDeSelect(STATUS_UNSUCCESSFUL, Context);
+					return;
+				}
+				
+				// MDL is mapped. Fix the buffer.
+				Context->Buffer = (PVOID)&MdlBuffer[(ULONG)Context->Buffer];
+				Pointer = (PUCHAR)Context->Buffer;
+			}
+			
+			if (Context->DmaBuffer == NULL) {
+				// Allocate a clear map buffer.
+				KeAcquireSpinLockAtDpcLevel(&s_SdmcDmaMapLock);
+				ULONG BufferPage = RtlFindClearBitsAndSet(&s_SdmcDmaMap, 1, 0);
+				KeReleaseSpinLockFromDpcLevel(&s_SdmcDmaMapLock);
+				if (BufferPage == 0xFFFFFFFF) {
+					SdmcpLowAsyncDeSelect(STATUS_INSUFFICIENT_RESOURCES, Context);
+					return;
+				}
+				Context->DmaBuffer = (PUCHAR)s_SdmcDmaBuffer + (BufferPage * PAGE_SIZE);
+				Context->BufferPage = BufferPage;
+			}
+		} else {
+			ULONG IoCount = Context->IoCount;
+			Pointer += SDMC_SECTOR_SIZE * IoCount;
+			Context->Sector += IoCount;
+			Context->Count -= IoCount;
+			Context->Irp->IoStatus.Information += (IoCount * SDMC_SECTOR_SIZE);
+			ContextArr->Length -= IoCount;
+		}
+		
+		if (Context->State == LOCK_STATE_LAST_PAGE || Context->Count == 0) {
+			// This chunk is finished. Is the whole write request finished?
+			if (ContextArr->Length == 0 || ContextArr->SectorTableRemaining == 0) {
+				// Free the map buffer.
+				SdmcpLowFreeMapBuffer(Context);
+				
+				SdmcpLowAsyncDeSelect(Status, Context);
+				return;
+			}
+			
+			// Still data to write.
+			Context->State = LOCK_STATE_NEXT_PAGE;
+			ContextArr->Offset = 0;
+			ContextArr->SectorTableEntry++;
+			ContextArr->SectorTableRemaining--;
+			Context->Sector = ContextArr->SectorTableEntry->sector;
+			Context->Count = ContextArr->SectorTableEntry->count;
+		}
+		
+		// Calculate the parameters for the next read operation.
+		ULONG Offset = Context->Sector;
+		if (s_SdmcIsHighCapacity == FALSE) Offset *= SDMC_SECTOR_SIZE;
+		ULONG IoCount = SDMC_SECTORS_IN_PAGE;
+		if (Context->Count < SDMC_SECTORS_IN_PAGE) IoCount = Context->Count;
+		Context->IoCount = IoCount;
+		Context->Buffer = Pointer;
+		
+		// Swap64 from the original buffer into the map buffer.
+		if (((ULONG)Pointer & 7) == 0) {
+			// Pointer is 64-bit aligned, swap from the pointer directly into the DMA buffer
+			endian_swap64(Context->DmaBuffer, Pointer, SDMC_SECTOR_SIZE * IoCount);
+		}
+		else {
+			// Not 64-bit aligned, copy then swap.
+			RtlCopyMemory(Context->DmaBuffer, Pointer, SDMC_SECTOR_SIZE * IoCount);
+			endian_swap64(Context->DmaBuffer, Context->DmaBuffer, SDMC_SECTOR_SIZE * IoCount);
+		}
+		// Cache invalidation not needed as IOP PXI driver does that.
+		
+		if (IoCount == Context->Count) Context->State = LOCK_STATE_LAST_PAGE;
+		else Context->State = LOCK_STATE_NEXT_PAGE;
+		
+		Status = SdmcpSendCommandAsync(
+			SDIO_CMD_WRITEMULTIBLOCK,
+			SDIO_TYPE_CMD,
+			SDIO_RESPONSE_R1,
+			Offset,
+			IoCount,
+			SDMC_SECTOR_SIZE,
+			Context->DmaBuffer,
+			(IOP_CALLBACK)SdmcpWriteSectorsArrSeizedAsync,
+			Context
+		);
+		
+		if (!NT_SUCCESS(Status)) {
+			// Previous call did not succeed.
+			
+			// Free the map buffer.
+			SdmcpLowFreeMapBuffer(Context);
+			
+			SdmcpLowAsyncDeSelect(Status, Context);
+			return;
+		}
+		
+		return;
+	}
+	
+	// Unknown state?
+	// Free the map buffer, if needed.
+	SdmcpLowFreeMapBuffer(Context);
+	
+	SdmcpLowAsyncDeSelect(STATUS_UNSUCCESSFUL, Context);
+}
+
+static void SdmcpGetStatusSeizedAsync(NTSTATUS Status, ULONG Result, PSDMC_SEIZED_CONTEXT Context) {
+	if (Context->State == LOCK_STATE_SELECT) {
+		Context->State = LOCK_STATE_FINISHED;
+		NTSTATUS Status = HalIopIoctlAsyncDpc(
+			s_hIosSdmc,
+			IOCTL_SDIO_GETSTATUS,
+			NULL,
+			0,
+			Context->DmaBuffer,
+			sizeof(ULONG),
+			IOCTL_SWAP_NONE,
+			IOCTL_SWAP_NONE,
+			(IOP_CALLBACK)SdmcpGetStatusSeizedAsync,
+			Context
+		);
+		if (!NT_SUCCESS(Status)) {
+			Context->Irp->IoStatus.Status = Status;
+			SdmcpLowFinishPacket(Context);
+		}
+		return;
+	}
+	
+	if (!NT_SUCCESS(Status)) {
+		// Previous call did not succeed.
+		Context->Irp->IoStatus.Status = Status;
+		SdmcpLowFinishPacket(Context);
+		return;
+	}
+	
+	// must be LOCK_STATE_FINISHED
+	Context->Irp->IoStatus.Status = Status;
+	Context->Irp->IoStatus.Information = sizeof(ULONG) * 2;
+	SdmcpLowFinishPacket(Context);
+	return;
+}
+
+
+IO_ALLOCATION_ACTION SdmcLowSeizedController(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID NullBase, PSDMC_LOWLEVEL_EXTENSION Ext) {
+	PIO_STACK_LOCATION Stack = IoGetCurrentIrpStackLocation(Irp);
+	
+	// Fill in the context in the controller extension.
+	PSDMC_SEIZED_CONTEXT Context = *(PSDMC_SEIZED_CONTEXT*)Ext->DiskController->ControllerExtension;
+	Context->DeviceObject = DeviceObject;
+	Context->Irp = Irp;
+	Context->DiskController = Ext->DiskController;
+	Context->State = LOCK_STATE_SELECT;
+	Context->BufferPage = 0xFFFFFFFF;
+	Context->DmaBuffer = NULL;
+	
+	if (Stack->MajorFunction == IRP_MJ_DEVICE_CONTROL) {
+		// GetStatus
+		Context->DmaBuffer = Irp->UserBuffer;
+		SdmcpGetStatusSeizedAsync(STATUS_SUCCESS, 0, Context);
+		return KeepObject;
+	}
+	
+	Context->Sector = Stack->Parameters.Read.ByteOffset.LowPart;
+	Context->Buffer = Irp->UserBuffer;
+	Context->Count = Stack->Parameters.Read.Length;
+	Context->Mdl = Irp->MdlAddress;
+	
+	if (Stack->MajorFunction == IRP_MJ_READ) {
+		SdmcpReadSectorsSeizedAsync(STATUS_SUCCESS, 0, Context);
+	} else if (Stack->MajorFunction == IRP_MJ_WRITE) {
+		SdmcpWriteSectorsSeizedAsync(STATUS_SUCCESS, 0, Context);
+	} else {
+		// Should not get here.
+		Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
+		// Complete the IRP.
+		IoCompleteRequest(Irp, IO_DISK_INCREMENT);
+		// Start next IRP request.
+		IoStartNextPacket(DeviceObject, FALSE);
+		return DeallocateObject;
+	}
+	
+	return KeepObject;
+}
+
+NTSTATUS SdmcLowStartIo(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+	PSDMC_LOWLEVEL_EXTENSION Ext = (PSDMC_LOWLEVEL_EXTENSION)DeviceObject->DeviceExtension;
+	
+	PIO_STACK_LOCATION Stack = IoGetCurrentIrpStackLocation(Irp);
+	if (Stack->MajorFunction != IRP_MJ_READ && Stack->MajorFunction != IRP_MJ_WRITE && Stack->MajorFunction != IRP_MJ_DEVICE_CONTROL) {
+		IoStartNextPacket(DeviceObject, FALSE);
+		Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
+		sync_before_exec_this_cpu(Irp, sizeof(*Irp));
+		IoCompleteRequest(Irp, IO_DISK_INCREMENT);
+		return STATUS_INVALID_PARAMETER;
+	}
+	
+	// Seize the controller object of the disk device
+	IoAllocateController(
+		Ext->DiskController,
+		DeviceObject,
+		(PDRIVER_CONTROL)SdmcLowSeizedController,
+		Ext
+	);
+}
+
+void SdmcLowUseLowDevice(PDEVICE_OBJECT DeviceObject) {
+	//HalDisplayString("SDMC: Using low device\n");
+	s_SdmcLowDevice = DeviceObject;
 }
 
 enum {
@@ -1102,7 +2552,43 @@ DSTATUS SdmcFfsStatus(void) {
 	if (s_SdmcIsInitialised == FALSE) return STA_NOINIT;
 	
 	ULONG CardStatus;
-	NTSTATUS Status = SdmcpGetStatusExt(&CardStatus);
+	NTSTATUS Status;
+	if (s_SdmcLowDevice != NULL) {
+		KEVENT Event;
+		IO_STATUS_BLOCK Iosb;
+		KeInitializeEvent(&Event, NotificationEvent, FALSE);
+		PULONG lStatus = HalIopAlloc(0x20);
+		if (lStatus == NULL) return STA_NOINIT;
+		PIRP Irp = IoBuildDeviceIoControlRequest(IOCTL_SDMC_GET_STATUS, s_SdmcLowDevice, NULL, 0, lStatus, 0x20, FALSE, &Event, &Iosb);
+		if (Irp == NULL) {
+			//HalDisplayString("SDMC: IOCTL_SDMC_GET_STATUS could not allocate IRP\n");
+			return STA_NOINIT;
+		}
+		// Set the flags for synchronous paging IO as the caller may be for that.
+		// If the caller is not for paging IO, setting these flags just leads to the fast path and not unlocking MDL
+		// (which is the correct decision for when MDL is used as the caller's MDL is passed in)
+		// If the caller is for paging IO, not setting these flags is a bug which leads to hang as the IRP doesn't complete correctly.
+		Irp->Flags |= IRP_PAGING_IO | IRP_SYNCHRONOUS_PAGING_IO;
+		sync_before_exec_this_cpu(Irp, sizeof(*Irp));
+		Status = IoCallDriver(s_SdmcLowDevice, Irp);
+		if (Status == STATUS_PENDING) {
+			KeWaitForSingleObject(&Event, Executive, KernelMode, FALSE, NULL);
+			Status = Iosb.Status;
+		}
+		if (NT_SUCCESS(Status)) CardStatus = lStatus[1];
+#if 0
+		if (!NT_SUCCESS(Status)) {
+			char Buffer[1024];
+			_snprintf(Buffer, sizeof(Buffer), "SDMC: IOCTL_SDMC_GET_STATUS failed %08x\n", Status);
+			HalDisplayString(Buffer);
+		} else {
+			char Buffer[1024];
+			_snprintf(Buffer, sizeof(Buffer), "SDMC: IOCTL_SDMC_GET_STATUS success %08x\n", CardStatus);
+			HalDisplayString(Buffer);
+		}
+#endif
+		HalIopFree(lStatus);
+	} else Status = SdmcpGetStatusExt(&CardStatus);
 	if (!NT_SUCCESS(Status)) {
 		return STA_NOINIT;
 	}
@@ -1139,22 +2625,158 @@ static DRESULT SdmcpStatusToDresult(NTSTATUS Status) {
 DRESULT SdmcFfsRead(
 	PVOID buff,		/* Data buffer to store read data */
 	ULONG sector,	/* Start sector in LBA */
-	ULONG count		/* Number of sectors to read */
+	ULONG count,		/* Number of sectors to read */
+	PMDL mdl
 ) {
 	if (SdmcFfsStatus() & (STA_NODISK|STA_NOINIT)) return RES_NOTRDY;
-	NTSTATUS Status = SdmcReadSectors(sector, count, buff);
+	NTSTATUS Status;
+	if (s_SdmcLowDevice != NULL) {
+#if 0
+		{
+			char Buffer[1024];
+			_snprintf(Buffer, sizeof(Buffer), "SDMC: LowRead %08x(%d)\n", sector, count);
+			HalDisplayString(Buffer);
+		}
+#endif
+		KEVENT Event;
+		IO_STATUS_BLOCK Iosb;
+		KeInitializeEvent(&Event, NotificationEvent, FALSE);
+		PIRP Irp = IoAllocateIrp(s_SdmcLowDevice->StackSize, FALSE);
+		if (Irp == NULL) {
+			//HalDisplayString("SDMC: LowRead could not allocate IRP\n");
+			return RES_ERROR;
+		}
+		PIO_STACK_LOCATION Stack = IoGetNextIrpStackLocation(Irp);
+		Stack->MajorFunction = IRP_MJ_READ;
+		Irp->MdlAddress = mdl;
+		Irp->UserBuffer = buff;
+		Stack->Parameters.Read.Length = count;
+		Stack->Parameters.Read.ByteOffset.QuadPart = sector;
+		Irp->UserIosb = &Iosb;
+		Irp->UserEvent = &Event;
+		// Set the flags for synchronous paging IO as the caller may be for that.
+		// If the caller is not for paging IO, setting these flags just leads to the fast path and not unlocking MDL
+		// (which is the correct decision for when MDL is used as the caller's MDL is passed in)
+		// If the caller is for paging IO, not setting these flags is a bug which leads to hang as the IRP doesn't complete correctly.
+		KIRQL CurrentIrql;
+		KeRaiseIrql(APC_LEVEL, &CurrentIrql);
+		Irp->Flags |= IRP_PAGING_IO | IRP_SYNCHRONOUS_PAGING_IO;
+		Irp->Tail.Overlay.Thread = PsGetCurrentThread();
+		IoQueueThreadIrp(Irp);
+		sync_before_exec_this_cpu(Irp, sizeof(*Irp));
+		Status = IoCallDriver(s_SdmcLowDevice, Irp);
+		if (Status == STATUS_PENDING) {
+			KeWaitForSingleObject(&Event, Executive, KernelMode, FALSE, NULL);
+			Status = Iosb.Status;
+		}
+		KeLowerIrql(CurrentIrql);
+#if 0
+		if (!NT_SUCCESS(Status)) {
+			char Buffer[1024];
+			_snprintf(Buffer, sizeof(Buffer), "SDMC: LowRead failed %08x\n", Status);
+			HalDisplayString(Buffer);
+		}
+		else if (Iosb.Information != count) {
+			char Buffer[1024];
+			_snprintf(Buffer, sizeof(Buffer), "SDMC: LowRead failed %d!=%d\n", count, Iosb.Information);
+			HalDisplayString(Buffer);
+			return RES_ERROR;
+		}
+#endif
+	} else Status = SdmcReadSectors(sector, count, buff, mdl);
 	return SdmcpStatusToDresult(Status);
 }
 
 DRESULT SdmcFfsWrite(
 	const void* buff,		/* Data buffer to store read data */
 	ULONG sector,	/* Start sector in LBA */
-	ULONG count		/* Number of sectors to read */
+	ULONG count,		/* Number of sectors to read */
+	PMDL mdl
 ) {
 	DSTATUS FfsStatus = SdmcFfsStatus();
 	if (FfsStatus & (STA_NODISK|STA_NOINIT)) return RES_NOTRDY;
 	if (FfsStatus & STA_PROTECT) return RES_WRPRT;
-	NTSTATUS Status = SdmcWriteSectors(sector, count, buff);
+	NTSTATUS Status;
+	if (s_SdmcLowDevice != NULL) {
+#if 0
+		{
+			char Buffer[1024];
+			_snprintf(Buffer, sizeof(Buffer), "SDMC: LowWrite %08x(%d)\n", sector, count);
+			HalDisplayString(Buffer);
+		}
+#endif
+		KEVENT Event;
+		IO_STATUS_BLOCK Iosb;
+		KeInitializeEvent(&Event, NotificationEvent, FALSE);
+		PIRP Irp = IoAllocateIrp(s_SdmcLowDevice->StackSize, FALSE);
+		if (Irp == NULL) {
+			//HalDisplayString("SDMC: LowWrite could not allocate IRP\n");
+			return RES_ERROR;
+		}
+		PIO_STACK_LOCATION Stack = IoGetNextIrpStackLocation(Irp);
+		Stack->MajorFunction = IRP_MJ_WRITE;
+		Irp->MdlAddress = mdl;
+		Irp->UserBuffer = buff;
+		Stack->Parameters.Read.Length = count;
+		Stack->Parameters.Read.ByteOffset.QuadPart = sector;
+		Irp->UserIosb = &Iosb;
+		Irp->UserEvent = &Event;
+		// Set the flags for synchronous paging IO as the caller may be for that.
+		// If the caller is not for paging IO, setting these flags just leads to the fast path and not unlocking MDL
+		// (which is the correct decision for when MDL is used as the caller's MDL is passed in)
+		// If the caller is for paging IO, not setting these flags is a bug which leads to hang as the IRP doesn't complete correctly.
+		KIRQL CurrentIrql;
+		KeRaiseIrql(APC_LEVEL, &CurrentIrql);
+		Irp->Flags |= IRP_PAGING_IO | IRP_SYNCHRONOUS_PAGING_IO;
+		Irp->Tail.Overlay.Thread = PsGetCurrentThread();
+		IoQueueThreadIrp(Irp);
+		sync_before_exec_this_cpu(Irp, sizeof(*Irp));
+		Status = IoCallDriver(s_SdmcLowDevice, Irp);
+		if (Status == STATUS_PENDING) {
+			KeWaitForSingleObject(&Event, Executive, KernelMode, FALSE, NULL);
+			Status = Iosb.Status;
+		}
+		KeLowerIrql(CurrentIrql);
+#if 0
+		if (!NT_SUCCESS(Status)) {
+			char Buffer[1024];
+			_snprintf(Buffer, sizeof(Buffer), "SDMC: LowWrite failed %08x\n", Status);
+			HalDisplayString(Buffer);
+		}
+		else if (Iosb.Information != count) {
+			char Buffer[1024];
+			_snprintf(Buffer, sizeof(Buffer), "SDMC: LowWrite failed %d!=%d\n", count, Iosb.Information);
+			HalDisplayString(Buffer);
+			return RES_ERROR;
+		}
+#endif
+	} else Status = SdmcWriteSectors(sector, count, buff, mdl);
+	return SdmcpStatusToDresult(Status);
+}
+
+DRESULT SdmcFfsCopy(
+	void* dest,
+	void* src,
+	ULONG count,
+	ULONG toMdl
+) {
+	
+	PSDMC_DPC_CONTEXT Context = SdmcpGetDpcContext();
+	if (Context == NULL) return SdmcpStatusToDresult(STATUS_INSUFFICIENT_RESOURCES);
+	
+	Context->Dest = dest;
+	Context->Source = src;
+	Context->Length = count;
+	Context->ToMdl = toMdl;
+	
+	if (!SdmcpQueueDpc(Context)) {
+		SdmcpReleaseDpcContext(Context);
+		return SdmcpStatusToDresult(STATUS_INSUFFICIENT_RESOURCES);
+	}
+	
+	KeWaitForSingleObject( &Context->Event, Executive, KernelMode, FALSE, NULL);
+	NTSTATUS Status = Context->Status;
+	SdmcpReleaseDpcContext(Context);
 	return SdmcpStatusToDresult(Status);
 }
 

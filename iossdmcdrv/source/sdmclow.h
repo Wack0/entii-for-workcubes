@@ -1,0 +1,46 @@
+#pragma once
+#include "ff.h"
+
+typedef enum _SDMC_LOCK_STATE {
+	LOCK_STATE_STATUS,
+	LOCK_STATE_SELECT,
+	LOCK_STATE_FIRST_PAGE,
+	LOCK_STATE_NEXT_PAGE,
+	LOCK_STATE_LAST_PAGE,
+	LOCK_STATE_FINISHED
+} SDMC_LOCK_STATE;
+
+typedef struct _SDMC_SEIZED_CONTEXT {
+	PDEVICE_OBJECT DeviceObject;
+	PIRP Irp;
+	PCONTROLLER_OBJECT DiskController;
+	ULONG Sector;
+	ULONG Count;
+	PVOID Buffer;
+	PMDL Mdl;
+	SDMC_LOCK_STATE State;
+	ULONG IoCount;
+	ULONG BufferPage;
+	PVOID DmaBuffer;
+} SDMC_SEIZED_CONTEXT, *PSDMC_SEIZED_CONTEXT;
+
+typedef struct _SDMC_SECTARR_SEIZED_CONTEXT {
+	SDMC_SEIZED_CONTEXT Base;
+	FILSECT* SectorTableEntry;
+	ULONG SectorTableRemaining;
+	ULONG Offset;
+	ULONG Length;
+	PULONG StatusPtr;
+} SDMC_SECTARR_SEIZED_CONTEXT, *PSDMC_SECTARR_SEIZED_CONTEXT;
+_Static_assert(__builtin_offsetof(SDMC_SECTARR_SEIZED_CONTEXT, Base) == 0);
+
+typedef struct _SDMC_LOWLEVEL_EXTENSION {
+	PVOID Unused[2]; // ensure DiskController is in same location as SDMC_EMU_EXTENSION
+	PCONTROLLER_OBJECT DiskController;
+} SDMC_LOWLEVEL_EXTENSION, *PSDMC_LOWLEVEL_EXTENSION;
+_Static_assert(__builtin_offsetof(SDMC_LOWLEVEL_EXTENSION, DiskController) == 8);
+
+#define IOCTL_SDMC_GET_STATUS CTL_CODE(0x8000 | FILE_DEVICE_DISK, 0x800, METHOD_NEITHER, FILE_READ_DATA | FILE_WRITE_DATA)
+
+void SdmcpReadSectorsArrSeizedAsync(NTSTATUS Status, ULONG Result, PSDMC_SECTARR_SEIZED_CONTEXT Context);
+void SdmcpWriteSectorsArrSeizedAsync(NTSTATUS Status, ULONG Result, PSDMC_SECTARR_SEIZED_CONTEXT Context);
