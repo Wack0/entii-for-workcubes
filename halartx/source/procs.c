@@ -36,7 +36,6 @@ BOOLEAN HalStartNextProcessor(IN PLOADER_PARAMETER_BLOCK LoaderBlock, IN PKPROCE
 	if (HalpSystemIsUniprocessor()) return FALSE;
 	if (s_LastProcessorStarted == 2) return FALSE;
 	BOOLEAN IsCafe = HalpSystemIsCafe();
-	if (!IsCafe && s_LastProcessorStarted == 1) return FALSE;
 	
 	// Violate the license agreement. (NT Workstation only allows 2 CPUs)
 	// KeRegisteredProcessors located 4 bytes after exported KeNumberProcessors, this is true in all of PPC NT
@@ -172,12 +171,14 @@ BOOLEAN HalStartNextProcessor(IN PLOADER_PARAMETER_BLOCK LoaderBlock, IN PKPROCE
 		MmioWriteBase32(HalpPxiRegisters, 0x70, AipProt | 1);
 	}
 	
+#if 0
 	if (MmioReadBase32(HalpPxiRegisters, 0x24) == 0) {
 		char Buffer[128];
 		_snprintf(Buffer, sizeof(Buffer), "HAL: Failed to start CPU %d\n", NextCore);
 		HalDisplayString(Buffer);
 		return FALSE;
 	}
+#endif
 	MmioWriteBase32(HalpPxiRegisters, 0x24, 0);
 	
 	while (*(volatile ULONG*)(&s_DummyRestartBlock[NextCore].BootStatus) == 0 && *(volatile KIRQL*)(ProcessorState->ContextFrame.Gpr4 + __builtin_offsetof(KPCR, CurrentIrql)) != 2) {
@@ -190,7 +191,6 @@ BOOLEAN HalStartNextProcessor(IN PLOADER_PARAMETER_BLOCK LoaderBlock, IN PKPROCE
 // Determine if all processors are started.
 BOOLEAN HalAllProcessorsStarted(void) {
 	if (HalpSystemIsUniprocessor()) return TRUE;
-	if (!HalpSystemIsCafe()) return (s_LastProcessorStarted == 1); // only use 2 cores in wiimode
 	return (s_LastProcessorStarted == 2); // core2 is last.
 }
 
