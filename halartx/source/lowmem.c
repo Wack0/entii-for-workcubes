@@ -44,8 +44,6 @@ static PBYTE mem_mem(PBYTE startPos, const void* pattern, size_t size, size_t pa
     return NULL;
 }
 
-BOOLEAN HalpHookKernelPeLoader(PVOID ImageBase);
-
 // Relocate all code from 0x3010 to 0x2000
 // 0x2000 is an unused exception handler (used for PowerPC 601 only)
 // Addresses in the 0x3010+ range can get overwritten on real hardware
@@ -162,20 +160,6 @@ BOOLEAN HalpFixLowMem(PLOADER_PARAMETER_BLOCK LoaderBlock) {
 		}
 		// 0x200 could run straight into 0x300 so allow for that
 		if (ExhIndex == 0 && ExhOffset > 0x300) ExhIndex++;
-	}
-	
-	// Is this an Espresso CPU?
-	BOOLEAN IsMultiprocessorEspresso = FALSE;
-	if (HalpCpuIsEspresso()) {
-		// Is this a multiprocessor kernel?
-		// In this case, some instructions were placed in a code cave at real0.
-		// Otherwise, real0+8 is zero.
-		IsMultiprocessorEspresso = (*(PULONG)&Real0[8] != 0);
-	}
-	
-	// If this is multiprocessor espresso, hook the kernel's PE loader.
-	if (IsMultiprocessorEspresso) {
-		if (!HalpHookKernelPeLoader((PVOID)ImageBase)) return FALSE;
 	}
 	
 	// Copy entire real0.
