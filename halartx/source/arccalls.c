@@ -14,20 +14,6 @@ static PVOID s_FlipperResetRegisters = NULL;
 static ULONG s_StmImmBufIn[8 + (32/4)];
 static ULONG s_StmImmBufOut[8 + (32/4)];
 
-static void sync_before_exec(const void* p, ULONG len)
-{
-
-	ULONG a, b;
-
-	a = (ULONG)p & ~0x1f;
-	b = ((ULONG)p + len + 0x1f) & ~0x1f;
-	
-	for (; a < b; a += 32)
-		asm("dcbst 0,%0 ; sync ; icbi 0,%0" : : "b"(a));
-
-	asm("sync ; isync");
-}
-
 void HalpTermInit(void) {
 	// Map the reset registers.
 	PHYSICAL_ADDRESS PhysAddr;
@@ -58,7 +44,7 @@ static void TermPowerOffSystem(BOOLEAN Reset) {
 		// Copy reload stub back to where it's expected to be. (in physical address space, not virtual)
 		RtlCopyMemory( s_ReloadStubReal0, s_ReloadStub, 0x1800 );
 		// Flush dcache and icache for this range.
-		sync_before_exec( s_ReloadStubReal0, 0x1800 );
+		HalSyncBeforeExecution( s_ReloadStubReal0, 0x1800 );
 		// Disable interrupts.
 		KeRaiseIrql(HIGH_LEVEL, &OldIrql);
 		// Switch to big endian mode and branch to reset stub

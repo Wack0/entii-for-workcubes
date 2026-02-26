@@ -28,21 +28,6 @@ static BOOLEAN HalpSystemIsUniprocessor(void) {
 	return FALSE;
 }
 
-// https://github.com/fail0verflow/hbc/blob/a8e5f6c0f7e484c7f7112967eee6eee47b27d9ac/wiipax/stub/sync.c#L29
-static void sync_before_exec(const void* p, ULONG len)
-{
-
-	ULONG a, b;
-
-	a = (ULONG)p & ~0x1f;
-	b = ((ULONG)p + len + 0x1f) & ~0x1f;
-
-	for (; a < b; a += 32)
-		asm("dcbst 0,%0 ; sync ; icbi 0,%0" : : "b"(a));
-
-	asm("sync ; isync");
-}
-
 #define EXI_WRITE_BOOT_VECTOR(Index) MmioWriteBase32(MMIO_OFFSET(HalpExiRegs, BootVector[Index]), BootCode[Index])
 #define WRITE_BOOT_VECTOR(Index) MmioWriteBase32(BootVector, Index * sizeof(ULONG), BootCode[Index])
 
@@ -65,7 +50,7 @@ BOOLEAN HalStartNextProcessor(IN PLOADER_PARAMETER_BLOCK LoaderBlock, IN PKPROCE
 		PULONG KeRegisteredProcessors = (PULONG)&pKeNumberProcessors[4];
 		
 		*KeRegisteredProcessors = 32;
-		sync_before_exec(KeRegisteredProcessors, sizeof(*KeRegisteredProcessors));
+		HalSyncBeforeExecution(KeRegisteredProcessors, sizeof(*KeRegisteredProcessors));
 	}
 	
 	// Write some code at the boot vector.
@@ -93,7 +78,7 @@ BOOLEAN HalStartNextProcessor(IN PLOADER_PARAMETER_BLOCK LoaderBlock, IN PKPROCE
 	_Static_assert(sizeof(s_BootCode) <= sizeof(HalpExiRegs->BootVector));
 	
 	// Make sure the cache is flushed for KeStartProcessor.
-	sync_before_exec((PVOID)ProcessorState->ContextFrame.Iar, 0x100);
+	HalSyncBeforeExecution((PVOID)ProcessorState->ContextFrame.Iar, 0x100);
 	
 	// Copy the bootcode to the stack.
 	ULONG BootCode[sizeof(s_BootCode) / sizeof(s_BootCode[0])];
@@ -131,7 +116,7 @@ BOOLEAN HalStartNextProcessor(IN PLOADER_PARAMETER_BLOCK LoaderBlock, IN PKPROCE
 		WRITE_BOOT_VECTOR(13);
 		WRITE_BOOT_VECTOR(14);
 		WRITE_BOOT_VECTOR(15);
-		sync_before_exec(BootVector, 0x40);
+		HalSyncBeforeExecution(BootVector, 0x40);
 		KePhase0DeleteIoMap(0x08100100, 0x40);
 	} else {
 		// Wiimode
