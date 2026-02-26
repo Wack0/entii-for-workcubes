@@ -45,10 +45,10 @@ static inline BOOLEAN HalpCpuIsEspresso(void) {
 
 static inline BOOLEAN HalpSystemIsCafe(void) {
 	// Instead of using memory lookups,
-	// check for CPU = espresso and BCR mask 0x08000000
-	// This bit hangs the core when in wiimode.
+	// check for CPU = espresso and SCR mask 0x0C000000
+	// This is the bits for vwii mode.
 	if (!HalpCpuIsEspresso()) return FALSE;
-	return (__mfspr(SPR_BCR) & 0x08000000) != 0;
+	return (__mfspr(SPR_SCR) & 0x0C000000) != 0x0C000000;
 }
 
 void HalSyncBeforeExecution(PVOID BaseAddress, ULONG Length);
