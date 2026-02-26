@@ -1600,8 +1600,11 @@ void OslHookInit(PVOID BlOpen, PVOID BlFileTable, PVOID BlSetupForNt, PVOID BlRe
     // This is to work around a hardware erratum on multiprocessor Espresso.
     // When NT is booted, the HAL can hook the kernel's PE loader to do the same thing.
     
-    // On wiimode Espresso, the multicore coherency hardware gets disabled by the bootrom (and reverting that register change causes PPC to hang),
-    // so only a single core can run in that scenario. (2 cores very unstable - hang in text setup - 3 cores even more unstable - hang when initialising text setup)
+    // ...it turns out the stwcx errata is related to the L2 cache, which is not used.
+    // Instead, patches are needed for setting memory coherence bits across all page table entries, which for some reason NT PPC does not do.
+    // (how did NT PPC ever work multiprocessor???)
+    // Keep the stwcx/etc patching anyway for the kernel and boot drivers though, just in case.
+    // This allows all 3 cores to work on wiimode Espresso too.
     ULONG Pvr;
     __asm__ __volatile__("mfpvr %0" : "=r"(Pvr));
     Pvr >>= 16;
@@ -1609,7 +1612,7 @@ void OslHookInit(PVOID BlOpen, PVOID BlFileTable, PVOID BlSetupForNt, PVOID BlRe
     Pvr = 0x7001;
     if (true) {
 #else
-    if (Pvr == 0x7001 && s_RuntimePointers[RUNTIME_SYSTEM_TYPE].v == ARTX_SYSTEM_LATTE) {
+    if (Pvr == 0x7001) {
 #endif
         orig_BlOpen = (PBL_OPEN_ROUTINE)BlOpen;
         s_BlFileTable = (PBL_FILE_TABLE)BlFileTable;
