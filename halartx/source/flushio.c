@@ -46,8 +46,8 @@ void HalFlushIoBuffers(PMDL Mdl, BOOLEAN ReadOperation, BOOLEAN DmaOperation) {
 void HalSyncBeforeExecution(PVOID BaseAddress, ULONG Length) {
 	ULONG a, b;
 
-	a = (ULONG)p & ~0x1f;
-	b = ((ULONG)p + len + 0x1f) & ~0x1f;
+	a = (ULONG)BaseAddress & ~0x1f;
+	b = ((ULONG)BaseAddress + Length + 0x1f) & ~0x1f;
 
 	for (; a < b; a += 32)
 		asm("dcbst 0,%0 ; sync ; icbi 0,%0" : : "b"(a));
