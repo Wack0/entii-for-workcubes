@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<app version="1">
+  <name>Arcldr</name>
+  <coder>Wack0</coder>
+  <version>v20250329</version>
+  <release_date>20250329</release_date>
+  <short_description>Windows NT Bootloader</short_description>
+  <long_description>An ARC firmware bootloader used to initialize and run t>
+  <category>Loaders</category>
+</app>
