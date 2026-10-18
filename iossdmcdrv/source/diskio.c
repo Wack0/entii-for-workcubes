@@ -12,8 +12,9 @@
 
 BYTE SdmcFfsStatus(void);
 DSTATUS SdmcFfsInit(void);
-DRESULT SdmcFfsRead(void* buff, DWORD sector, DWORD count);
-DRESULT SdmcFfsWrite(const void* buff, DWORD sector, DWORD count);
+DRESULT SdmcFfsRead(void* buff, DWORD sector, DWORD count, void* mdl);
+DRESULT SdmcFfsWrite(const void* buff, DWORD sector, DWORD count, void* mdl);
+DRESULT SdmcFfsCopy(void* dest, void* src, DWORD count, DWORD toMdl);
 DRESULT SdmcFfsIoctl(BYTE cmd, void* buff);
 
 /*-----------------------------------------------------------------------*/
@@ -50,10 +51,11 @@ DRESULT disk_read (
 	BYTE pdrv,		/* Physical drive nmuber to identify the drive */
 	BYTE *buff,		/* Data buffer to store read data */
 	LBA_t sector,	/* Start sector in LBA */
-	UINT count		/* Number of sectors to read */
+	UINT count,		/* Number of sectors to read */
+	void* mdl /* NT Memory descritor list describing physical area of buffer */
 )
 {
-	return SdmcFfsRead(buff, sector, count);
+	return SdmcFfsRead(buff, sector, count, mdl);
 }
 
 
@@ -68,13 +70,24 @@ DRESULT disk_write (
 	BYTE pdrv,			/* Physical drive nmuber to identify the drive */
 	const BYTE *buff,	/* Data to be written */
 	LBA_t sector,		/* Start sector in LBA */
-	UINT count			/* Number of sectors to write */
+	UINT count,			/* Number of sectors to write */
+	void* mdl /* NT Memory descritor list describing physical area of buffer */
 )
 {
-	return SdmcFfsWrite(buff, sector, count);
+	return SdmcFfsWrite(buff, sector, count, mdl);
 }
 
 #endif
+
+DRESULT plat_copy(
+	void* dest, // Destination buffer or MDL
+	void* source, // Source buffer or MDL
+	UINT count, // Number of bytes to copy
+	UINT toMdl // Destination is MDL, otherwise source is MDL
+)
+{
+	return SdmcFfsCopy(dest, source, count, toMdl);
+}
 
 
 /*-----------------------------------------------------------------------*/

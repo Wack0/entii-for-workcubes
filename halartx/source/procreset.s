@@ -27,7 +27,7 @@ HalpProcessorReset:
 	sync
 	// enable caches
 	lis r.6, 0x0011
-	ori r.6, r.6, 0xC024
+	ori r.6, r.6, 0xC12C
 	mtspr 1008, r.6
 	
 	isync

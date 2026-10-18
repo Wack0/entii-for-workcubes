@@ -50,3 +50,5 @@ static inline BOOLEAN HalpSystemIsCafe(void) {
 	if (!HalpCpuIsEspresso()) return FALSE;
 	return (__mfspr(SPR_BCR) & 0x08000000) != 0;
 }
+
+void HalSyncBeforeExecution(PVOID BaseAddress, ULONG Length);

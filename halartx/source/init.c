@@ -50,13 +50,6 @@ HalInitSystem (
 		
 		if (Prcb->Number == 0) {
 			
-			// Fix low memory.
-			if (!HalpFixLowMem(LoaderBlock)) {
-				KeInitializeSpinLock(&HalpDisplayAdapterLock);
-				HalpInitializeDisplay0(LoaderBlock);
-				return FALSE;
-			}
-			
 			// Set the interval clock increment value.
 			
 			HalpCurrentTimeIncrement = MAXIMUM_INCREMENT;
@@ -74,6 +67,11 @@ HalInitSystem (
 			// Initialize the display adapter.
 			
 			if (!HalpInitializeDisplay0(LoaderBlock)) {
+				return FALSE;
+			}
+			
+			// Fix low memory.
+			if (!HalpFixLowMem(LoaderBlock)) {
 				return FALSE;
 			}
 		}

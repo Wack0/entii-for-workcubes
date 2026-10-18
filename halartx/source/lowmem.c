@@ -19,21 +19,6 @@ static LONG HookSignExt16(SHORT x) {
     return (LONG)x;
 }
 
-// https://github.com/fail0verflow/hbc/blob/a8e5f6c0f7e484c7f7112967eee6eee47b27d9ac/wiipax/stub/sync.c#L29
-static void sync_before_exec(const void* p, ULONG len)
-{
-
-	ULONG a, b;
-
-	a = (ULONG)p & ~0x1f;
-	b = ((ULONG)p + len + 0x1f) & ~0x1f;
-
-	for (; a < b; a += 32)
-		asm("dcbst 0,%0 ; sync ; icbi 0,%0" : : "b"(a));
-
-	asm("sync ; isync");
-}
-
 // Boyer-Moore Horspool algorithm adapted from http://www-igm.univ-mlv.fr/~lecroq/string/node18.html#SECTION00180
 static PBYTE mem_mem(PBYTE startPos, const void* pattern, size_t size, size_t patternSize)
 {
@@ -58,8 +43,6 @@ static PBYTE mem_mem(PBYTE startPos, const void* pattern, size_t size, size_t pa
 
     return NULL;
 }
-
-BOOLEAN HalpHookKernelPeLoader(PVOID ImageBase);
 
 // Relocate all code from 0x3010 to 0x2000
 // 0x2000 is an unused exception handler (used for PowerPC 601 only)
@@ -179,23 +162,9 @@ BOOLEAN HalpFixLowMem(PLOADER_PARAMETER_BLOCK LoaderBlock) {
 		if (ExhIndex == 0 && ExhOffset > 0x300) ExhIndex++;
 	}
 	
-	// Is this an Espresso CPU?
-	BOOLEAN IsMultiprocessorEspresso = FALSE;
-	if (HalpCpuIsEspresso()) {
-		// Is this a multiprocessor kernel?
-		// In this case, some instructions were placed in a code cave at real0.
-		// Otherwise, real0+8 is zero.
-		IsMultiprocessorEspresso = (*(PULONG)&Real0[8] != 0);
-	}
-	
-	// If this is multiprocessor espresso, hook the kernel's PE loader.
-	if (IsMultiprocessorEspresso) {
-		if (!HalpHookKernelPeLoader((PVOID)ImageBase)) return FALSE;
-	}
-	
 	// Copy entire real0.
 	memcpy((PVOID)0x80000000, Real0, Length + 0x3010);
-	sync_before_exec((PVOID)0x80000000, 0x3800);
+	HalSyncBeforeExecution((PVOID)0x80000000, 0x3800);
 	
 	return TRUE;
 }

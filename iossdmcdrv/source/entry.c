@@ -10,6 +10,7 @@
 #include "zwdd.h"
 #include "ff.h"
 #include "sdmc.h"
+#include "sdmclow.h"
 
 // We wrap FATFS around the raw SDMC (over IOS) block IO driver.
 // We expose FS images on SD card as raw disks.
@@ -23,6 +24,9 @@
 // 0-3 => EXI, 4 => IOSSDMC
 #define DEVNAME_ENVIRONMENT "\\Device\\ArcEnviron4"
 
+// The device for the low level block access to the SD card(kernel mode only)
+#define DEVNAME_LOWLEVEL "\\Device\\Sdmc0"
+
 #define SIGNATURE_PARTITION 'PART'
 #define SIGNATURE_DISK 'DISK'
 
@@ -33,8 +37,11 @@ static const char s_SdControllerPath[] = "multi(1)";
 static FATFS s_FatFs;
 static PCONTROLLER_OBJECT s_ControllerObject = NULL;
 static PDEVICE_OBJECT s_EnvironmentDevice = NULL;
+static PDEVICE_OBJECT s_LowlevelDevice = NULL;
+static PCONTROLLER_OBJECT s_LowlevelController = NULL;
 
 BYTE s_Wtf[0x10];
+static BOOLEAN s_IsUsingLowDevice = FALSE;
 
 typedef struct _SDMC_EMU_EXTENSION SDMC_EMU_EXTENSION, *PSDMC_EMU_EXTENSION;
 
@@ -59,6 +66,8 @@ struct _SDMC_EMU_EXTENSION {
 	PDEVICE_OBJECT DeviceObject;
 	FIL FfsFile;
 	ULONG LinkMap[64];
+	FILSECT* SectArr;
+	ULONG SectArrCount;
 	BOOLEAN WriteProtected;
 	ULONG DiskNumber;
 	ULONG IoCount;
@@ -76,6 +85,7 @@ typedef struct _SDMC_IO_WORK_ITEM {
 	WORK_QUEUE_ITEM WorkItem;
 	PDEVICE_OBJECT DeviceObject;
 	PIRP Irp;
+	KEVENT Event;
 	BOOLEAN SinglePageAccess;
 } SDMC_IO_WORK_ITEM, *PSDMC_IO_WORK_ITEM;
 
@@ -225,6 +235,45 @@ static void SdmcEmuFinishDispatch(
 	IoCompleteRequest(Irp, IO_DISK_INCREMENT);
 }
 
+static NTSTATUS SdmcEmuDeviceLowCreate(
+	PDRIVER_OBJECT DriverObject
+) {
+	if (s_LowlevelController == NULL) {
+		s_LowlevelController = IoCreateController(sizeof(PSDMC_SEIZED_CONTEXT));
+		if (s_LowlevelController == NULL) return STATUS_INSUFFICIENT_RESOURCES;
+		PSDMC_SEIZED_CONTEXT ControllerExt = (PSDMC_SEIZED_CONTEXT)HalIopAlloc(sizeof(SDMC_SEIZED_CONTEXT));
+		if (ControllerExt == NULL) return STATUS_INSUFFICIENT_RESOURCES;
+		*(PSDMC_SEIZED_CONTEXT*)s_LowlevelController->ControllerExtension = ControllerExt;
+	}
+	
+	// Wrap an ANSI string around the device name.
+	STRING NtNameStr;
+	RtlInitString(&NtNameStr, DEVNAME_LOWLEVEL);
+	
+	// Convert to unicode.
+	UNICODE_STRING NtNameUs;
+	NTSTATUS Status = RtlAnsiStringToUnicodeString(&NtNameUs, &NtNameStr, TRUE);
+	if (!NT_SUCCESS(Status)) return Status;
+	
+	// Create the device object.
+	PDEVICE_OBJECT DeviceObject = NULL;
+	Status = IoCreateDevice(DriverObject, sizeof(SDMC_LOWLEVEL_EXTENSION), &NtNameUs, FILE_DEVICE_DISK, 0, FALSE, &DeviceObject);
+	RtlFreeUnicodeString(&NtNameUs);
+	if (!NT_SUCCESS(Status)) return Status;
+		
+	// Initialise the new device object.
+	DeviceObject->Flags |= DO_DIRECT_IO;
+	DeviceObject->AlignmentRequirement = SDMC_SECTOR_SIZE - 1;
+	DeviceObject->StackSize = 1;
+	
+	// Initialise the device extension.
+	PSDMC_LOWLEVEL_EXTENSION Ext = (PSDMC_LOWLEVEL_EXTENSION) DeviceObject->DeviceExtension;
+	Ext->DiskController = s_LowlevelController;
+	
+	s_LowlevelDevice = DeviceObject;
+	return Status;
+}
+
 static NTSTATUS SdmcEmuDeviceEnvCreate(
 	PDRIVER_OBJECT DriverObject,
 	FIL* FfsFile,
@@ -234,8 +283,11 @@ static NTSTATUS SdmcEmuDeviceEnvCreate(
 	if (s_EnvironmentDevice != NULL) return STATUS_OBJECT_NAME_COLLISION;
 	
 	if (s_ControllerObject == NULL) {
-		s_ControllerObject = IoCreateController(0);
+		s_ControllerObject = IoCreateController(sizeof(PSDMC_SECTARR_SEIZED_CONTEXT));
 		if (s_ControllerObject == NULL) return STATUS_INSUFFICIENT_RESOURCES;
+		PSDMC_SECTARR_SEIZED_CONTEXT ControllerExt = (PSDMC_SECTARR_SEIZED_CONTEXT)HalIopAlloc(sizeof(SDMC_SECTARR_SEIZED_CONTEXT));
+		if (ControllerExt == NULL) return STATUS_INSUFFICIENT_RESOURCES;
+		*(PSDMC_SECTARR_SEIZED_CONTEXT*)s_ControllerObject->ControllerExtension = ControllerExt;
 	}
 	
 	STRING NtNameStr;
@@ -274,7 +326,41 @@ static NTSTATUS SdmcEmuDeviceEnvCreate(
 		RtlCopyMemory(&Ext->FfsFile, FfsFile, sizeof(Ext->FfsFile));
 		Ext->FfsFile.cltbl = Ext->LinkMap;
 		Ext->LinkMap[0] = sizeof(Ext->LinkMap) / sizeof(Ext->LinkMap[0]);
-		if (f_lseek(&Ext->FfsFile, CREATE_LINKMAP) != FR_OK) Ext->FfsFile.cltbl = NULL;
+		FRESULT fr = f_lseek(&Ext->FfsFile, CREATE_LINKMAP);
+		ULONG SectArrCount = Ext->LinkMap[0] / 2;
+		if (fr != FR_OK) Ext->FfsFile.cltbl = NULL;
+		if (*KeNumberProcessors > 1) {
+			Ext->SectArr = ExAllocatePool(NonPagedPool, sizeof(FILSECT) * SectArrCount);
+			do {
+				if (Ext->SectArr == NULL) break;
+				ULONG SectArrCountReal = SectArrCount;
+				fr = f_getsec(&Ext->FfsFile, Ext->SectArr, &SectArrCountReal);
+				if (fr != FR_OK) {
+					ExFreePool(Ext->SectArr);
+					Ext->SectArr = NULL;
+					break;
+				}
+				if (SectArrCountReal > SectArrCount) {
+					ExFreePool(Ext->SectArr);
+					Ext->SectArr = ExAllocatePool(NonPagedPool, sizeof(FILSECT) * SectArrCountReal);
+					if (Ext->SectArr == NULL) break;
+					ULONG SectArrCountReal2 = SectArrCountReal;
+					fr = f_getsec(&Ext->FfsFile, Ext->SectArr, &SectArrCountReal2);
+					if (fr != FR_OK || SectArrCountReal2 > SectArrCountReal) {
+						ExFreePool(Ext->SectArr);
+						Ext->SectArr = NULL;
+						break;
+					}
+					SectArrCountReal = SectArrCountReal2;
+				}
+				SectArrCount = SectArrCountReal;
+			} while (FALSE);
+			if (Ext->SectArr == NULL) SectArrCount = 0;
+			Ext->SectArrCount = SectArrCount;
+		} else {
+			Ext->SectArr = NULL;
+			Ext->SectArrCount = 0;
+		}
 		Ext->WriteProtected = FALSE;
 		Ext->Signature = SIGNATURE_DISK;
 		Ext->DeviceObject = DeviceObject;
@@ -305,6 +391,9 @@ static NTSTATUS SdmcEmuDeviceCreateImpl(
 	if (s_ControllerObject == NULL) {
 		s_ControllerObject = IoCreateController(0);
 		if (s_ControllerObject == NULL) return STATUS_INSUFFICIENT_RESOURCES;
+		PSDMC_SECTARR_SEIZED_CONTEXT ControllerExt = (PSDMC_SECTARR_SEIZED_CONTEXT)HalIopAlloc(sizeof(SDMC_SECTARR_SEIZED_CONTEXT));
+		if (ControllerExt == NULL) return STATUS_INSUFFICIENT_RESOURCES;
+		*(PSDMC_SECTARR_SEIZED_CONTEXT*)s_ControllerObject->ControllerExtension = ControllerExt;
 	}
 	BOOLEAN IsHardDisk = DeviceType == FILE_DEVICE_DISK && DeviceCharacteristics == 0;
 	// Generate the NT object path name for this device.
@@ -381,7 +470,41 @@ static NTSTATUS SdmcEmuDeviceCreateImpl(
 		RtlCopyMemory(&Ext->FfsFile, FfsFile, sizeof(Ext->FfsFile));
 		Ext->FfsFile.cltbl = Ext->LinkMap;
 		Ext->LinkMap[0] = sizeof(Ext->LinkMap) / sizeof(Ext->LinkMap[0]);
-		if (f_lseek(&Ext->FfsFile, CREATE_LINKMAP) != FR_OK) Ext->FfsFile.cltbl = NULL;
+		FRESULT fr = f_lseek(&Ext->FfsFile, CREATE_LINKMAP);
+		ULONG SectArrCount = Ext->LinkMap[0] / 2;
+		if (fr != FR_OK) Ext->FfsFile.cltbl = NULL;
+		if (*KeNumberProcessors > 1) {
+			Ext->SectArr = ExAllocatePool(NonPagedPool, sizeof(FILSECT) * SectArrCount);
+			do {
+				if (Ext->SectArr == NULL) break;
+				ULONG SectArrCountReal = SectArrCount;
+				fr = f_getsec(&Ext->FfsFile, Ext->SectArr, &SectArrCountReal);
+				if (fr != FR_OK) {
+					ExFreePool(Ext->SectArr);
+					Ext->SectArr = NULL;
+					break;
+				}
+				if (SectArrCountReal > SectArrCount) {
+					ExFreePool(Ext->SectArr);
+					Ext->SectArr = ExAllocatePool(NonPagedPool, sizeof(FILSECT) * SectArrCountReal);
+					if (Ext->SectArr == NULL) break;
+					ULONG SectArrCountReal2 = SectArrCountReal;
+					fr = f_getsec(&Ext->FfsFile, Ext->SectArr, &SectArrCountReal2);
+					if (fr != FR_OK || SectArrCountReal2 > SectArrCountReal) {
+						ExFreePool(Ext->SectArr);
+						Ext->SectArr = NULL;
+						break;
+					}
+					SectArrCountReal = SectArrCountReal2;
+				}
+				SectArrCount = SectArrCountReal;
+			} while (FALSE);
+			if (Ext->SectArr == NULL) SectArrCount = 0;
+			Ext->SectArrCount = SectArrCount;
+		} else {
+			Ext->SectArr = NULL;
+			Ext->SectArrCount = 0;
+		}
 		Ext->WriteProtected = (DeviceCharacteristics & FILE_READ_ONLY_DEVICE) != 0;
 		Ext->Signature = SIGNATURE_DISK;
 		Ext->DeviceObject = DeviceObject;
@@ -528,7 +651,7 @@ static NTSTATUS SdmcEmuDiskCreate(
 }
 
 NTSTATUS SdmcDiskCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
-	if (DeviceObject == s_EnvironmentDevice && Irp->RequestorMode != KernelMode) {
+	if ((DeviceObject == s_EnvironmentDevice || DeviceObject == s_LowlevelDevice) && Irp->RequestorMode != KernelMode) {
 		Irp->IoStatus.Status = STATUS_ACCESS_DENIED;
 		IoCompleteRequest(Irp, IO_NO_INCREMENT);
 		return STATUS_ACCESS_DENIED;
@@ -542,8 +665,22 @@ NTSTATUS SdmcDiskCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 static void SdmcDiskStartIoImpl(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 
 extern __declspec(dllimport) KAFFINITY KeSetAffinityThread(PKTHREAD Thread, KAFFINITY Affinity);
+void SdmcDiskPagingWorkRoutine(PSDMC_IO_WORK_ITEM Parameter);
+
+NTSTATUS SdmcLowDiskRw(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+NTSTATUS SdmcLowStartIo(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+NTSTATUS SdmcLowDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+void SdmcLowUseLowDevice(PDEVICE_OBJECT DeviceObject);
 
 NTSTATUS SdmcDiskRw(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+	if (DeviceObject == s_LowlevelDevice) {
+		if (Irp->RequestorMode != KernelMode) {
+			Irp->IoStatus.Status = STATUS_ACCESS_DENIED;
+			IoCompleteRequest(Irp, IO_NO_INCREMENT);
+			return STATUS_ACCESS_DENIED;
+		}
+		return SdmcLowDiskRw(DeviceObject, Irp);
+	}
 	if (DeviceObject == s_EnvironmentDevice && Irp->RequestorMode != KernelMode) {
 		Irp->IoStatus.Status = STATUS_ACCESS_DENIED;
 		IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -557,7 +694,7 @@ NTSTATUS SdmcDiskRw(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 	
 	// Ensure the read is aligned to sector size.
 	// We are going down to an fs r/w, but we expose a disk.
-	if ((Length % SDMC_SECTOR_SIZE) != 0) {
+	if ((Length % SDMC_SECTOR_SIZE) != 0 || (s_IsUsingLowDevice && Ext->SectArr != NULL && SectorOffset != 0)) {
 		Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
 		IoCompleteRequest(Irp, IO_NO_INCREMENT);
 		return STATUS_INVALID_PARAMETER;
@@ -625,10 +762,19 @@ NTSTATUS SdmcDiskRw(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 	IoStartPacket(DeviceObject, Irp, &SectorOffset, NULL);
 	return STATUS_PENDING;
 #endif
+
+	if (s_IsUsingLowDevice && Ext->SectArr != NULL) {
+		// SectArr is non-NULL, so use the low-level operation.
+		SectorOffset = Offset.QuadPart / SDMC_SECTOR_SIZE;
+		Irp->IoStatus.Information = 0;
+		IoMarkIrpPending(Irp);
+		IoStartPacket(Ext->DeviceObject, Irp, &SectorOffset, NULL);
+		return STATUS_PENDING;
+	}
 	
-	KAFFINITY OldAffinity = KeSetAffinityThread(KeGetCurrentThread(), 1);
+	//KAFFINITY OldAffinity = KeSetAffinityThread(KeGetCurrentThread(), 1);
 	SdmcDiskStartIoImpl(DeviceObject, Irp);
-	KeSetAffinityThread(KeGetCurrentThread(), OldAffinity);
+	//KeSetAffinityThread(KeGetCurrentThread(), OldAffinity);
 	return Irp->IoStatus.Status;
 }
 
@@ -672,6 +818,9 @@ static void SdmcDiskStartIoImpl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 			SdmcEmuFinishDispatch(&Ext->FinishDpc, DeviceObject, Irp, Controller);
 			return;
 		}
+		// Go to DISPATCH_LEVEL when mapping the MDL.
+		//KIRQL OldIrql;
+		//KeRaiseIrql(DISPATCH_LEVEL, &OldIrql);
 		ULONG MdlFlags = Irp->MdlAddress->MdlFlags;
 		if ((MdlFlags & (MDL_MAPPED_TO_SYSTEM_VA | MDL_SOURCE_IS_NONPAGED_POOL)) == 0) {
 			BOOLEAN InvalidSystemMap = (MdlFlags & MDL_PARTIAL_HAS_BEEN_MAPPED) != 0;
@@ -679,25 +828,44 @@ static void SdmcDiskStartIoImpl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 				InvalidSystemMap = (MdlFlags & (MDL_PAGES_LOCKED | MDL_PARTIAL) == 0);
 			}
 			if (InvalidSystemMap) {
+				//KeLowerIrql(OldIrql);
 				Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
 				SdmcEmuFinishDispatch(&Ext->FinishDpc, DeviceObject, Irp, Controller);
 				return;
 			}
 		}
 		
-		PVOID Buffer = MmGetSystemAddressForMdl(Irp->MdlAddress);
+		if ((MdlFlags & MDL_SOURCE_IS_NONPAGED_POOL) == 0 && (MdlFlags & MDL_MAPPED_TO_SYSTEM_VA) != 0) {
+			// Not nonpaged pool and mapped to system VA.
+			// Unmap the locked pages first, this might help.
+			//MmUnmapLockedPages(Irp->MdlAddress->MappedSystemVa, Irp->MdlAddress);
+		}
+		
+#if 0
+		PVOID Buffer = MmGetSystemAddressForMdl(Irp->MdlAddress); //SdmcpGetSystemAddressForMdl(Irp->MdlAddress);
+		//if (Buffer == NULL) Buffer = MmGetSystemAddressForMdl(Irp->MdlAddress);
 		if (Buffer == NULL) {
+			//KeLowerIrql(OldIrql);
 			Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
-			SdmcEmuFinishDispatch(&Ext->FinishDpc, DeviceObject, Irp, Controller);
+			//SdmcEmuFinishDispatch(&Ext->FinishDpc, DeviceObject, Irp, Controller);
 			return;
 		}
+#endif
+		
+		// Flush dcache for all CPUs.
+		//HalSweepAllDcache();
+		
+		// Lower IRQL.
+		//KeLowerIrql(OldIrql);
+		
 		UINT Transferred;
 		ULONG Length = Stack->Parameters.Read.Length;
 		if (Stack->MajorFunction == IRP_MJ_READ) {
-			fr = f_read( &FfsFile, Buffer, Length, &Transferred);
+			fr = f_read( &FfsFile, NULL, Length, &Transferred, Irp->MdlAddress);
+			if (*KeNumberProcessors > 1) KeFlushIoBuffers(Irp->MdlAddress, TRUE, FALSE);
 		} else if (Stack->MajorFunction == IRP_MJ_WRITE) {
 			//HalDisplayString("SDMC: write\n");
-			fr = f_write( &FfsFile, Buffer, Length, &Transferred);
+			fr = f_write( &FfsFile, NULL, Length, &Transferred, Irp->MdlAddress);
 			// Ensure written data is flushed to disk.
 			if (fr == FR_OK) {
 				//HalDisplayString("SDMC: sync\n");
@@ -718,7 +886,7 @@ static void SdmcDiskStartIoImpl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 	FRESULT fr = f_lseek(&FfsFile, Stack->Parameters.Read.ByteOffset.QuadPart);
 	if (fr != FR_OK) {
 		Irp->IoStatus.Status = FresultToStatus(fr);
-		SdmcEmuFinishDispatch(&Ext->FinishDpc, DeviceObject, Irp, Controller);
+		//SdmcEmuFinishDispatch(&Ext->FinishDpc, DeviceObject, Irp, Controller);
 		return;
 	}
 	UINT Transferred;
@@ -727,38 +895,39 @@ static void SdmcDiskStartIoImpl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 	PVOID Buffer = ExAllocatePool(NonPagedPool, 0x1000);
 	if (Buffer == NULL) {
 		Irp->IoStatus.Status = STATUS_NO_MEMORY;
-		SdmcEmuFinishDispatch(&Ext->FinishDpc, DeviceObject, Irp, Controller);
+		//SdmcEmuFinishDispatch(&Ext->FinishDpc, DeviceObject, Irp, Controller);
 		return;
 	}
 	while (Length > 0) {
 		ULONG RoundLength = 0x1000;
 		if (Length < 0x1000) RoundLength = Length;
-		fr = f_read( &FfsFile, Buffer, RoundLength, &Transferred );
+		fr = f_read( &FfsFile, Buffer, RoundLength, &Transferred, NULL );
 		if (fr == FR_OK && Transferred != RoundLength) fr = FR_MKFS_ABORTED;
 		if (fr != FR_OK) {
 			ExFreePool(Buffer);
 			Irp->IoStatus.Status = FresultToStatus(fr);
-			SdmcEmuFinishDispatch(&Ext->FinishDpc, DeviceObject, Irp, Controller);
+			//SdmcEmuFinishDispatch(&Ext->FinishDpc, DeviceObject, Irp, Controller);
 			return;
 		}
 		Length -= RoundLength;
 	}
 	ExFreePool(Buffer);
 	Irp->IoStatus.Status = STATUS_SUCCESS;
-	SdmcEmuFinishDispatch(&Ext->FinishDpc, DeviceObject, Irp, Controller);
+	//SdmcEmuFinishDispatch(&Ext->FinishDpc, DeviceObject, Irp, Controller);
 }
 
 void SdmcDiskPagingWorkRoutine(PSDMC_IO_WORK_ITEM Parameter) {
 	// Grab the parameters.
 	PDEVICE_OBJECT DeviceObject = Parameter->DeviceObject;
 	PIRP Irp = Parameter->Irp;
-	// Free the work item
-	ExFreePool(Parameter);
 	
 	// Perform the I/O operation on the work thread
+	KAFFINITY OldAffinity = KeSetAffinityThread(KeGetCurrentThread(), 1);
 	SdmcDiskStartIoImpl(DeviceObject, Irp);
+	KeSetEvent(&Parameter->Event, (KPRIORITY) 0, FALSE);
+	KeSetAffinityThread(KeGetCurrentThread(), OldAffinity);
 	// Dereference the device object, this is what Io*WorkItem in NT5 does
-	ObDereferenceObject(DeviceObject);
+	//ObDereferenceObject(DeviceObject);
 }
 
 #define MS_TO_TIMEOUT(ms) ((ms) * 10000)
@@ -777,11 +946,143 @@ IO_ALLOCATION_ACTION SdmcDiskSeizedController(PDEVICE_OBJECT DeviceObject, PIRP 
 		// Going to have to recurse here as we don't even have the DPC
 		
 		// Complete the request.
-		IoCompleteRequest(Irp, IO_NO_INCREMENT);
+		IoCompleteRequest(Irp, IO_DISK_INCREMENT);
 		// Start next packet.
 		IoStartNextPacket(DeviceObject, FALSE);
 		// Release the controller on return so next packet can seize it.
 		return DeallocateObject;
+	}
+	
+	// If SectArr is non-NULL, this is a low-level operation not going through fatfs but rather the sector-length table.
+	if (s_IsUsingLowDevice && Ext->SectArr != NULL) {
+		// Fill in the context in the controller extension.
+		PSDMC_SECTARR_SEIZED_CONTEXT Context = *(PSDMC_SECTARR_SEIZED_CONTEXT*)Ext->DiskController->ControllerExtension;
+		
+		// Check the MDL map.
+		ULONG MdlFlags = Irp->MdlAddress->MdlFlags;
+		if ((MdlFlags & (MDL_MAPPED_TO_SYSTEM_VA | MDL_SOURCE_IS_NONPAGED_POOL)) == 0) {
+			BOOLEAN InvalidSystemMap = (MdlFlags & MDL_PARTIAL_HAS_BEEN_MAPPED) != 0;
+			if (!InvalidSystemMap) {
+				InvalidSystemMap = (MdlFlags & (MDL_PAGES_LOCKED | MDL_PARTIAL) == 0);
+			}
+			if (InvalidSystemMap) {
+				//KeLowerIrql(OldIrql);
+				Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
+				// Complete the request.
+				IoCompleteRequest(Irp, IO_DISK_INCREMENT);
+				// Start next packet.
+				IoStartNextPacket(DeviceObject, FALSE);
+				// Release the controller on return so next packet can seize it.
+				return DeallocateObject;
+			}
+		}
+		
+		// First, find the sector table entry for the sector being read.
+		// Get offset and length, and convert to sector.
+		PIO_STACK_LOCATION Stack = IoGetCurrentIrpStackLocation(Irp);
+		ULONG Length = Stack->Parameters.Read.Length / SDMC_SECTOR_SIZE;
+		LARGE_INTEGER Offset = Stack->Parameters.Read.ByteOffset;
+		Offset.QuadPart /= SDMC_SECTOR_SIZE;
+#if 0
+		if (Stack->MajorFunction == IRP_MJ_READ) {
+			char Buffer[1024];
+			_snprintf(Buffer, sizeof(Buffer), "SDMC: LowArrRead: Offset = %08x%08x (%08x) (%08x)\n", Offset.HighPart, Offset.LowPart, Length, Ext->DiskController);
+			HalDisplayString(Buffer);
+		}
+#endif
+		// Set the length.
+		Context->Length = Length;
+		// Walk through the sector table, find the entry corresponding to the offset.
+		Context->SectorTableEntry = NULL;
+		LARGE_INTEGER SectOff;
+		SectOff.QuadPart = 0;
+		for (ULONG i = 0; i < Ext->SectArrCount; i++) {
+			FILSECT* entry = &Ext->SectArr[i];
+			LARGE_INTEGER FragOff;
+			FragOff.QuadPart = Offset.QuadPart - SectOff.QuadPart;
+#if 0
+			if (Stack->MajorFunction == IRP_MJ_READ) {
+				LARGE_INTEGER start;
+				start.QuadPart = entry->sector;
+				LARGE_INTEGER end;
+				end.QuadPart = entry->sector + entry->count;
+				LARGE_INTEGER count;
+				count.QuadPart = entry->count;
+				char Buffer[1024];
+				_snprintf(Buffer, sizeof(Buffer), "SDMC: %08x%08x -> %08x%08x-%08x%08x (%08x%08x), %08x%08x\n",
+					SectOff.HighPart, SectOff.LowPart, start.HighPart, start.LowPart, end.HighPart, end.LowPart, count.HighPart, count.LowPart, FragOff.HighPart, FragOff.LowPart);
+				HalDisplayString(Buffer);
+			}
+#endif
+			// FragOff is the number of sectors from this fragment to the wanted sector.
+			// SectOff is the startingn sector of this fragment.
+			// Offset is the wanted sector.
+			// This fragment is not the wanted fragment if:
+			// Offset is less than SectOff (ie, wanted sector is before this fragment)
+			// or
+			// FragOff is not less than the fragment length (ie, wanted sector is after this fragment)
+			if (Offset.QuadPart < SectOff.QuadPart || FragOff.QuadPart >= entry->count) {
+				SectOff.QuadPart += entry->count;
+				continue;
+			}
+			Context->SectorTableEntry = entry;
+			Context->SectorTableRemaining = Ext->SectArrCount - i - 1;
+			Context->Offset = FragOff.LowPart;
+			break;
+		}
+		if (Context->SectorTableEntry == NULL) {
+			// ???
+			//HalDisplayString("SDMC: not found in table\n");
+			Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
+			// Complete the request.
+			IoCompleteRequest(Irp, IO_DISK_INCREMENT);
+			// Start next packet.
+			IoStartNextPacket(DeviceObject, FALSE);
+			// Release the controller on return so next packet can seize it.
+			return DeallocateObject;
+		}
+		Context->StatusPtr = HalIopAlloc(0x20);
+		if (Context->StatusPtr == NULL) {
+			// ???
+			//HalDisplayString("SDMC: could not allocate status\n");
+			Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
+			// Complete the request.
+			IoCompleteRequest(Irp, IO_DISK_INCREMENT);
+			// Start next packet.
+			IoStartNextPacket(DeviceObject, FALSE);
+			// Release the controller on return so next packet can seize it.
+			return DeallocateObject;
+		}
+		// Set up the base context.
+		PSDMC_SEIZED_CONTEXT CtxBase = &Context->Base;
+		CtxBase->DeviceObject = DeviceObject;
+		CtxBase->Irp = Irp;
+		CtxBase->DiskController = Ext->DiskController;
+		CtxBase->State = LOCK_STATE_STATUS;
+		CtxBase->BufferPage = 0xFFFFFFFF;
+		CtxBase->DmaBuffer = NULL;
+		CtxBase->Sector = Context->SectorTableEntry->sector + Context->Offset;
+		CtxBase->Count = Length;
+		ULONG RealCount = (Context->SectorTableEntry->count - Context->Offset);
+		if (RealCount < Length) CtxBase->Count = RealCount;
+		CtxBase->Buffer = NULL;
+		CtxBase->Mdl = Irp->MdlAddress;
+		if (Stack->MajorFunction == IRP_MJ_READ) {
+			SdmcpReadSectorsArrSeizedAsync(STATUS_SUCCESS, 0, Context);
+		} else if (Stack->MajorFunction == IRP_MJ_WRITE) {
+			SdmcpWriteSectorsArrSeizedAsync(STATUS_SUCCESS, 0, Context);
+		} else {
+			// ???
+			Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
+			// Complete the request.
+			IoCompleteRequest(Irp, IO_DISK_INCREMENT);
+			// Start next packet.
+			IoStartNextPacket(DeviceObject, FALSE);
+			// Release the controller on return so next packet can seize it.
+			return DeallocateObject;
+		}
+		
+		return KeepObject;
 	}
 	
 	// Allocate the work item
@@ -791,7 +1092,7 @@ IO_ALLOCATION_ACTION SdmcDiskSeizedController(PDEVICE_OBJECT DeviceObject, PIRP 
 		// um.
 		Irp->IoStatus.Status = STATUS_NO_MEMORY;
 		// Complete the request.
-		IoCompleteRequest(Irp, IO_NO_INCREMENT);
+		IoCompleteRequest(Irp, IO_DISK_INCREMENT);
 		// Start next packet.
 		IoStartNextPacket(DeviceObject, FALSE);
 		// Release the controller on return so next packet can seize it.
@@ -827,6 +1128,10 @@ IO_ALLOCATION_ACTION SdmcDiskSeizedController(PDEVICE_OBJECT DeviceObject, PIRP 
 }
 
 void SdmcDiskStartIo(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+	if (DeviceObject == s_LowlevelDevice) {
+		SdmcLowStartIo(DeviceObject, Irp);
+		return;
+	}
 	PSDMC_EMU_EXTENSION Ext = (PSDMC_EMU_EXTENSION)DeviceObject->DeviceExtension;
 	// ensure this is actually a disk
 	if (Ext->Signature == SIGNATURE_PARTITION) {
@@ -836,7 +1141,7 @@ void SdmcDiskStartIo(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 	}
 	if (Ext->Signature != SIGNATURE_DISK) {
 		Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
-		IoCompleteRequest(Irp, IO_NO_INCREMENT);
+		IoCompleteRequest(Irp, IO_DISK_INCREMENT);
 		IoStartNextPacket(DeviceObject, FALSE);
 		return;
 	}
@@ -992,6 +1297,14 @@ static void SdmcDiskUpdateDevices(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 }
 
 NTSTATUS SdmcDiskDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+	if (DeviceObject == s_LowlevelDevice) {
+		if (Irp->RequestorMode != KernelMode) {
+			Irp->IoStatus.Status = STATUS_ACCESS_DENIED;
+			IoCompleteRequest(Irp, IO_NO_INCREMENT);
+			return STATUS_ACCESS_DENIED;
+		}
+		return SdmcLowDeviceControl(DeviceObject, Irp);
+	}
 	if (DeviceObject == s_EnvironmentDevice) {
 		Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
 		IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -1404,6 +1717,18 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
 	
 	if (!EntryPointsSet) {
 		SdmcpSetEntryPoints(DriverObject);
+	}
+	
+	if (*KeNumberProcessors > 1) {
+		// Create the low level device.
+		NTSTATUS Status = SdmcEmuDeviceLowCreate(DriverObject);
+		if (!NT_SUCCESS(Status)) {
+			return STATUS_SUCCESS;
+		}
+		
+		// Set the low level block driver to use the low level device.
+		SdmcLowUseLowDevice(s_LowlevelDevice);
+		s_IsUsingLowDevice = TRUE;
 	}
 	
 	return STATUS_SUCCESS;
