@@ -1050,6 +1050,6 @@ unsigned long long IdeexiWriteBlocks(EXI_IDE_DRIVE drive, PVOID buffer, unsigned
 void IdeexiInit(void) {
 	// Initialise every drive.
 	for (ULONG i = 0; i < IDE_DRIVE_COUNT; i++) {
-		memset(&s_IdeState[i], 0, sizeof(s_IdeState));
+		memset(&s_IdeState[i], 0, sizeof(s_IdeState[i]));
 	}
 }

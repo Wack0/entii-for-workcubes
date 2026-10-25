@@ -1259,7 +1259,7 @@ static PSDMC_STATE SdmcpGetMountedState(EXI_SDMC_DRIVE drive) {
 void SdmcexiInit(void) {
 	// Initialise every drive.
 	for (ULONG i = 0; i < SDMC_DRIVE_COUNT; i++) {
-		memset(&s_SdmcState[i], 0, sizeof(s_SdmcState));
+		memset(&s_SdmcState[i], 0, sizeof(s_SdmcState[i]));
 		PSDMC_STATE state = &s_SdmcState[i];
 		state->ProtocolType = SDMC_OFFSET_BYTE;
 		state->ClockFreq = EXI_CLOCK_13_5;

@@ -814,7 +814,7 @@ uint64_t IdeexiWriteBlocks(EXI_IDE_DRIVE drive, PVOID buffer, uint64_t sector, U
 void IdeexiInit(void) {
 	// Initialise every drive.
 	for (ULONG i = 0; i < IDE_DRIVE_COUNT; i++) {
-		memset(&s_IdeState[i], 0, sizeof(s_IdeState));
+		memset(&s_IdeState[i], 0, sizeof(s_IdeState[i]));
 	}
 
 	// Try to mount every drive.
